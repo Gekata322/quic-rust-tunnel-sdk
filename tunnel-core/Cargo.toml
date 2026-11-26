@@ -1,0 +1,43 @@
+[package]
+name = "tunnel-core"
+description = "Клиентское ядро B2B-туннеля: QUIC-подключение, reconnect, инкапсуляция IP-пакетов; собирается как cdylib/staticlib для встраивания (iOS/Android/Desktop)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "tunnel_core"
+# lib       — юнит- и интеграционные тесты внутри workspace
+# cdylib    — динамическая библиотека: Android (JNI/uniffi), Desktop
+# staticlib — статическая линковка: iOS требует статические библиотеки
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+tunnel-proto = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# FFI-биндинги: cli — утилита генерации биндингов для Kotlin/Swift/Python,
+# scaffolding подключается макросом setup_scaffolding в lib.rs.
+uniffi = { workspace = true, features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+# Утилита генерации FFI-биндингов: `cargo run -p tunnel-core --bin uniffi-bindgen
+# -- generate-all --library <libtunnel_core.so> --out-dir <dir>` генерирует
+# kotlin+swift+python одной командой (см. build_sdk.sh).
+
+[dev-dependencies]
+# Интеграционные тесты поднимают локальный QUIC-сервер-«эхо».
+tunnel-proto = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+# Логи движка видны в тестах (with_test_writer).
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
