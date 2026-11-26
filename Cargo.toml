@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "tunnel-proto",
+    "tunnel-core",
+    "tunnel-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Внутренние крейты
+tunnel-proto = { path = "tunnel-proto" }
+
+# Асинхронный рантайм и транспорт
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+
+# Протокол и утилиты
+bytes = "1"
+bincode = "2.0"
+thiserror = "2"
+tracing = "0.1"
+
+# FFI-биндинги
+uniffi = { version = "0.32.2", features = ["cli"] }
+
+# Только для разработки/тестов
+rcgen = "0.14"
+
+# release-профиль SDK: максимум скорости и минимальный размер
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.release.package."*"]
+opt-level = 3
