@@ -1,0 +1,29 @@
+[package]
+name = "tunnel-server"
+description = "Сервер B2B-туннеля: авторизация токенов, пул виртуальных IP, таблица маршрутизации, TUN-интерфейс Linux, loopback-режим для тестов"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tunnel-server"
+path = "src/main.rs"
+
+[lib]
+
+[dependencies]
+tunnel-proto = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+bytes = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rcgen = { workspace = true }
+
+[dev-dependencies]
+tunnel-core = { path = "../tunnel-core" }
+rustls = { workspace = true }
+rcgen = { workspace = true }
