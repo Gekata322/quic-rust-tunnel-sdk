@@ -1,0 +1,14 @@
+[package]
+name = "tunnel-proto"
+description = "Общий протокол B2B-туннеля: управляющие сообщения, кадрирование IP-пакетов, разбор IPv4, константная проверка токенов, телеметрия"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+# Тесты протокола не требуют сети — только стандартная библиотека.
