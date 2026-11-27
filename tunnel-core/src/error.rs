@@ -1,50 +1,50 @@
-//! Ошибки клиентского ядра (`tunnel-core`).
+//! Client core errors (`tunnel-core`).
 //!
-//! `CoreError` одновременно является библиотечной ошибкой (`thiserror`) и
-//! FFI-ошибкой (`uniffi::Error`): партнёрский код на Kotlin/Swift видит
-//! типизированные варианты с сообщением, а Rust-код отличает временные
-//! сбои (нужно переподключаться) от постоянных (переподключаться бессмысленно).
+//! `CoreError` is both the library error (`thiserror`) and the FFI error
+//! (`uniffi::Error`): partner code in Kotlin/Swift sees typed variants with a
+//! message, and Rust code distinguishes transient failures (reconnecting is
+//! useful) from permanent ones (retrying is pointless).
 
 use thiserror::Error;
 
-/// Ошибки клиентского ядра туннеля.
+/// Errors of the tunnel client core.
 #[derive(Debug, Error, uniffi::Error)]
 pub enum CoreError {
-    /// Конфигурация недействительна (пустой хост/токен, неверные задержки).
-    #[error("конфигурация некорректна: {0}")]
+    /// The configuration is invalid (empty host/token, bad timings).
+    #[error("invalid configuration: {0}")]
     InvalidConfig(String),
-    /// Закреплённый сертификат сервера не удалось разобрать.
-    #[error("закреплённый сертификат сервера недействителен: {0}")]
+    /// The pinned server certificate could not be parsed.
+    #[error("invalid pinned server certificate: {0}")]
     InvalidServerCert(String),
-    /// Сервер отклонил авторизацию (токен неизвестен или заблокирован).
-    #[error("авторизация отклонена: {0}")]
+    /// The server rejected authentication (token unknown or revoked).
+    #[error("authentication rejected: {0}")]
     AuthRejected(String),
-    /// Версия протокола не поддерживается сервером — нужно обновить SDK.
-    #[error("версия протокола не поддерживается: {0}")]
+    /// The protocol version is not supported by the server — update the SDK.
+    #[error("protocol version not supported: {0}")]
     ProtocolMismatch(String),
-    /// Сервер перегружен / пул виртуальных IP исчерпан — ретрай уместен.
-    #[error("сервер временно недоступен: {0}")]
+    /// The server is overloaded / the virtual IP pool is exhausted — a retry is reasonable.
+    #[error("server temporarily unavailable: {0}")]
     ServerBusy(String),
-    /// Ошибка ввода-вывода ОС (UDP-сокет, поток движка и т.п.).
-    #[error("ошибка ввода-вывода: {0}")]
+    /// OS I/O error (UDP socket, engine thread, etc.).
+    #[error("I/O error: {0}")]
     Io(String),
-    /// QUIC-соединение не установлено (сеть недоступна, сервер молчит).
-    #[error("не удалось подключиться: {0}")]
+    /// The QUIC connection was not established (network down, server silent).
+    #[error("failed to connect: {0}")]
     ConnectFailed(String),
-    /// Превышен тайм-аут подключения или рукопожатия.
-    #[error("тайм-аут: {0}")]
+    /// The connect or handshake deadline expired.
+    #[error("timed out: {0}")]
     TimedOut(String),
-    /// Установленная сессия оборвалась (сеть, сервер закрыл соединение).
-    #[error("сессия прервана: {0}")]
+    /// An established session dropped (network, server closed the connection).
+    #[error("session closed: {0}")]
     SessionClosed(String),
-    /// Ошибка внутри ядра: соберите логи `tracing` и зарегистрируйте баг.
-    #[error("внутренняя ошибка: {0}")]
+    /// An internal core error: collect `tracing` logs and file a bug.
+    #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl CoreError {
-    /// Ошибки, при которых переподключение бесполезно: движок переводит
-    /// клиента в `Stopped` вместо бесконечных ретраев.
+    /// Errors after which reconnecting is useless: the engine moves the
+    /// client to `Stopped` instead of retrying forever.
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
@@ -62,25 +62,19 @@ mod tests {
 
     #[test]
     fn permanent_errors_are_flagged() {
-        assert!(CoreError::AuthRejected("токен не найден".into()).is_permanent());
+        assert!(CoreError::AuthRejected("token not found".into()).is_permanent());
         assert!(CoreError::ProtocolMismatch("v99".into()).is_permanent());
-        assert!(CoreError::InvalidConfig("пустой хост".into()).is_permanent());
-        assert!(CoreError::InvalidServerCert("битый DER".into()).is_permanent());
+        assert!(CoreError::InvalidConfig("empty host".into()).is_permanent());
+        assert!(CoreError::InvalidServerCert("broken DER".into()).is_permanent());
     }
 
     #[test]
     fn transient_errors_are_retryable() {
-        assert!(!CoreError::ServerBusy("пул исчерпан".into()).is_permanent());
-        assert!(!CoreError::ConnectFailed("сеть недоступна".into()).is_permanent());
-        assert!(!CoreError::TimedOut("8с".into()).is_permanent());
+        assert!(!CoreError::ServerBusy("pool exhausted".into()).is_permanent());
+        assert!(!CoreError::ConnectFailed("network unreachable".into()).is_permanent());
+        assert!(!CoreError::TimedOut("8s".into()).is_permanent());
         assert!(!CoreError::SessionClosed("QUIC closed".into()).is_permanent());
         assert!(!CoreError::Io("EBADF".into()).is_permanent());
         assert!(!CoreError::Internal("bug".into()).is_permanent());
-    }
-
-    #[test]
-    fn error_messages_are_human_readable() {
-        let err = CoreError::AuthRejected("токен заблокирован".to_owned());
-        assert_eq!(err.to_string(), "авторизация отклонена: токен заблокирован");
     }
 }

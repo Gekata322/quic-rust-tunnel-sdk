@@ -1,6 +1,6 @@
 [package]
 name = "tunnel-core"
-description = "Клиентское ядро B2B-туннеля: QUIC-подключение, reconnect, инкапсуляция IP-пакетов; собирается как cdylib/staticlib для встраивания (iOS/Android/Desktop)"
+description = "Client core of the B2B tunnel: QUIC connection, reconnect, IP packet encapsulation; builds as a cdylib/staticlib for embedding (iOS/Android/Desktop)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,9 @@ license.workspace = true
 
 [lib]
 name = "tunnel_core"
-# lib       — юнит- и интеграционные тесты внутри workspace
-# cdylib    — динамическая библиотека: Android (JNI/uniffi), Desktop
-# staticlib — статическая линковка: iOS требует статические библиотеки
+# lib       — unit and integration tests inside the workspace
+# cdylib    — dynamic library: Android (JNI/uniffi), Desktop
+# staticlib — static linking: iOS requires static libraries
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
@@ -21,23 +21,23 @@ rustls = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# FFI-биндинги: cli — утилита генерации биндингов для Kotlin/Swift/Python,
-# scaffolding подключается макросом setup_scaffolding в lib.rs.
+# FFI bindings: cli — the binding generation utility for Kotlin/Swift/Python;
+# scaffolding is attached by the setup_scaffolding macro in lib.rs.
 uniffi = { workspace = true, features = ["cli"] }
 
 [[bin]]
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
-# Утилита генерации FFI-биндингов: `cargo run -p tunnel-core --bin uniffi-bindgen
-# -- generate-all --library <libtunnel_core.so> --out-dir <dir>` генерирует
-# kotlin+swift+python одной командой (см. build_sdk.sh).
+# Utility for generating FFI bindings: `cargo run -p tunnel-core --bin uniffi-bindgen
+# -- generate-all --library <libtunnel_core.so> --out-dir <dir>` generates
+# kotlin+swift+python in one command (see build_sdk.sh).
 
 [dev-dependencies]
-# Интеграционные тесты поднимают локальный QUIC-сервер-«эхо».
+# Integration tests raise a local QUIC "echo" server.
 tunnel-proto = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
-# Логи движка видны в тестах (with_test_writer).
+# Engine logs are visible in tests (with_test_writer).
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
