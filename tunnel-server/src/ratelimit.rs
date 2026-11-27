@@ -58,15 +58,15 @@ impl RateLimiter {
         };
         let rate_bytes_per_sec = f64::from(mbps) * BYTES_PER_MBPS_PER_SEC;
         let capacity = (rate_bytes_per_sec * BURST_WINDOW_SECS).max(MIN_BURST_BYTES);
-        self.buckets
-            .lock()
-            .expect("limiter mutex")
-            .insert(vip, Bucket {
+        self.buckets.lock().expect("limiter mutex").insert(
+            vip,
+            Bucket {
                 tokens: capacity,
                 capacity,
                 rate_bytes_per_sec,
                 last_refill: Instant::now(),
-            });
+            },
+        );
     }
 
     /// Removes the session's bucket (idempotent).
@@ -83,7 +83,9 @@ impl RateLimiter {
             return true;
         };
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * bucket.rate_bytes_per_sec).min(bucket.capacity);
         bucket.last_refill = now;
 
@@ -112,7 +114,10 @@ mod tests {
         assert!(limiter.try_consume(vip(2), 1_000_000), "no bucket at all");
 
         limiter.register(vip(3), None);
-        assert!(limiter.try_consume(vip(3), 1_000_000), "no configured limit");
+        assert!(
+            limiter.try_consume(vip(3), 1_000_000),
+            "no configured limit"
+        );
     }
 
     #[tokio::test]
@@ -124,7 +129,10 @@ mod tests {
         let limiter = RateLimiter::new();
         limiter.register(vip(2), Some(1));
 
-        assert!(limiter.try_consume(vip(2), 125_000), "the full bucket passes");
+        assert!(
+            limiter.try_consume(vip(2), 125_000),
+            "the full bucket passes"
+        );
         assert!(
             !limiter.try_consume(vip(2), 60_000),
             "an empty bucket drops: refilling this much takes 0.5s"
@@ -133,7 +141,10 @@ mod tests {
         // 20 ms of sleep refills at least 125_000 × 0.02 = 2_500 bytes
         // (sleep guarantees at least the requested duration).
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(limiter.try_consume(vip(2), 2_000), "the refill is available");
+        assert!(
+            limiter.try_consume(vip(2), 2_000),
+            "the refill is available"
+        );
         assert!(
             !limiter.try_consume(vip(2), 125_000),
             "refill is capped at the capacity: at most 123_000 tokens remain"

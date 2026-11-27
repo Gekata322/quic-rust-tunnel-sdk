@@ -77,7 +77,11 @@ impl SessionTracker {
 
     /// Removes the entry; the session task calls it on every exit path.
     pub(crate) fn remove(&self, vip: Ipv4Addr) -> bool {
-        self.sessions.lock().expect("tracker mutex").remove(&vip).is_some()
+        self.sessions
+            .lock()
+            .expect("tracker mutex")
+            .remove(&vip)
+            .is_some()
     }
 
     /// Removes and returns the sessions that were silent for longer than
@@ -151,24 +155,21 @@ mod tests {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![tunnel_proto::ALPN_TUNNEL_V1.to_vec()];
-        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-            .expect("QUIC over TLS");
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC over TLS");
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address"))
             .expect("client endpoint");
         client.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
 
         let connect = client.connect(addr, "localhost").expect("connect started");
-        let (conn, _server_conn) = tokio::join!(
-            async { connect.await.expect("handshake") },
-            async {
+        let (conn, _server_conn) =
+            tokio::join!(async { connect.await.expect("handshake") }, async {
                 server
                     .accept()
                     .await
                     .expect("incoming connection")
                     .await
                     .expect("handshake")
-            }
-        );
+            });
         (conn, client)
     }
 
