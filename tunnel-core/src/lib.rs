@@ -9,11 +9,16 @@
 //!    [`ffi::ConnectionStatus`] + callback, [`ffi::Telemetry`],
 //!    [`ffi::TunnelConfig`].
 //! 2. **Engine** ([`engine`]) — a background thread running the session loop:
-//!    exponential backoff ([`backoff`]), network-change reaction, stop
-//!    coordination, duplicate-free status callback notifications.
+//!    exponential backoff ([`backoff`]), QUIC connection migration on network
+//!    changes, stop coordination, duplicate-free status callback notifications.
 //! 3. **Session** ([`session`]) — one attempt: QUIC connection (`quinn`),
 //!    the `Hello → Welcome/Reject` handshake with the pinned server
 //!    certificate, the data plane on QUIC datagrams and keepalive with RTT.
+//!
+//! A network change (Wi-Fi ↔ cellular) does not cost a reconnect: the engine
+//! rebinds the endpoint's UDP socket ([`crate::engine::EngineShared::migrate`])
+//! and the QUIC connection migrates per RFC 9000 — the VIP and the data plane
+//! survive. A reconnect happens only when the migration cannot be set up.
 //!
 //! Packets are exchanged with the platform through a poll model without
 //! callback interfaces: the platform writes IP packets to

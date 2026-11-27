@@ -1,5 +1,5 @@
 //! Core engine: the session loop, exponential reconnects, stop coordination
-//! and network changes.
+//! and QUIC connection migration on network changes.
 //!
 //! The engine lives in a dedicated background thread (a single-threaded tokio
 //! runtime — frugal for mobile devices). The FFI object
@@ -29,6 +29,24 @@ use crate::session::{SessionOutcome, run_session};
 /// not congestion.
 const PACKET_QUEUE_LEN: usize = 256;
 
+/// Transport resources of one established session: the QUIC connection and
+/// the endpoint that owns its UDP socket. Both are cheap handles (reference
+/// counted); they stay valid while the session is alive.
+#[derive(Clone)]
+pub(crate) struct ActiveTransport {
+    pub(crate) conn: quinn::Connection,
+    pub(crate) endpoint: quinn::Endpoint,
+}
+
+/// Binds an ephemeral UDP socket matching the endpoint's address family.
+fn bind_ephemeral_socket(endpoint: &quinn::Endpoint) -> std::io::Result<std::net::UdpSocket> {
+    let bind_addr: std::net::SocketAddr = match endpoint.local_addr()? {
+        addr if addr.is_ipv6() => "[::]:0".parse().expect("wildcard address is valid"),
+        _ => "0.0.0.0:0".parse().expect("wildcard address is valid"),
+    };
+    std::net::UdpSocket::bind(bind_addr)
+}
+
 /// State shared between the FFI object and the engine thread.
 pub(crate) struct EngineShared {
     pub(crate) config: TunnelConfig,
@@ -45,8 +63,10 @@ pub(crate) struct EngineShared {
     pub(crate) metrics: Arc<Metrics>,
     /// RTT of the last ping/pong, ms; 0 — not measured in this session yet.
     pub(crate) last_ping_ms: AtomicU64,
-    /// The active QUIC connection — for force-closing on a network change.
-    active_conn: Mutex<Option<quinn::Connection>>,
+    /// The transport resources of the current session: the QUIC connection
+    /// plus the endpoint that owns its UDP socket. Migration rebinding needs
+    /// both; a full reconnect clears the slot.
+    active: Mutex<Option<ActiveTransport>>,
     /// Partner status callback (uniffi callback-interface).
     callback: Mutex<Option<Box<dyn ConnectionStatusCallback>>>,
     /// The last status sent to the callback — for notification deduplication.
@@ -73,7 +93,7 @@ impl EngineShared {
             packet_out_rx: Mutex::new(packet_out_rx),
             metrics: Arc::new(Metrics::default()),
             last_ping_ms: AtomicU64::new(0),
-            active_conn: Mutex::new(None),
+            active: Mutex::new(None),
             callback: Mutex::new(None),
             last_status: Mutex::new(None),
             ever_connected: AtomicBool::new(false),
@@ -149,30 +169,58 @@ impl EngineShared {
         self.last_ping_ms.store(0, Ordering::Relaxed);
     }
 
-    /// Remembers the active QUIC connection (or clears the slot).
-    pub(crate) fn set_active_conn(&self, conn: Option<quinn::Connection>) {
-        if let Ok(mut slot) = self.active_conn.lock() {
-            *slot = conn;
+    /// Remembers the transport resources of the established session.
+    pub(crate) fn set_active_transport(&self, transport: ActiveTransport) {
+        if let Ok(mut slot) = self.active.lock() {
+            *slot = Some(transport);
         }
     }
 
-    /// Takes the active QUIC connection out of the slot (for a graceful close
+    /// Takes the transport resources out of the slot (for a graceful close
     /// after the session future was cancelled by the stop command).
-    pub(crate) fn take_active_conn(&self) -> Option<quinn::Connection> {
-        self.active_conn.lock().ok()?.take()
+    pub(crate) fn take_active_transport(&self) -> Option<ActiveTransport> {
+        self.active.lock().ok()?.take()
     }
 
-    /// Network change hint: the active QUIC connection is closed immediately,
-    /// the engine leaves the session and reconnects (already on the new interface).
-    pub(crate) fn force_reconnect(&self) {
-        let conn = match self.active_conn.lock() {
-            Ok(mut slot) => slot.take(),
+    /// Network change hint (Wi-Fi ↔ cellular, NAT rebinding): the endpoint's
+    /// UDP socket is rebound to a fresh local port while the QUIC connection
+    /// stays alive — RFC 9000 connection migration. quinn rotates the
+    /// connection ID and emits a PING, the server validates the new path, so
+    /// the VIP, telemetry and the data plane survive without a reconnect.
+    /// A reconnect is the fallback only when the migration cannot be set up
+    /// (no established session, socket bind failure).
+    pub(crate) fn migrate(&self) {
+        let transport = match self.active.lock() {
+            Ok(slot) => slot.clone(),
             Err(_) => return,
         };
-        if let Some(conn) = conn {
-            tracing::info!("network changed: closing the active QUIC connection");
-            conn.close(quinn::VarInt::from_u32(0), b"network-changed");
+        let Some(transport) = transport else {
+            // No established session: nothing to migrate — every connect
+            // attempt re-resolves DNS and binds a fresh socket anyway.
+            tracing::debug!("network changed: no established session to migrate");
+            return;
+        };
+
+        let socket = match bind_ephemeral_socket(&transport.endpoint) {
+            Ok(socket) => socket,
+            Err(err) => return self.fallback_to_reconnect(&transport.conn, err),
+        };
+        match transport.endpoint.rebind(socket) {
+            Ok(()) => {
+                tracing::info!(
+                    "network changed: UDP socket rebound, migrating the QUIC connection"
+                );
+            }
+            Err(err) => self.fallback_to_reconnect(&transport.conn, err),
         }
+    }
+
+    /// Migration setup failed (rare: bind or rebind I/O error): tear the
+    /// connection down so the engine reconnects from scratch on the new
+    /// interface — the only path where a network change costs a reconnect.
+    fn fallback_to_reconnect(&self, conn: &quinn::Connection, err: std::io::Error) {
+        tracing::warn!(%err, "network changed: migration setup failed — reconnecting");
+        conn.close(quinn::VarInt::from_u32(0), b"migration-failed");
     }
 
     /// Graceful stop: idempotent, `Stopped` is not overwritten.
@@ -236,7 +284,8 @@ pub(crate) async fn run(shared: Arc<EngineShared>, mut packet_in_rx: mpsc::Recei
                 // `conn.close()` may never run: send CONNECTION_CLOSE here,
                 // otherwise the peer keeps the session until the idle timeout
                 // (the address stays taken, routing stays registered).
-                if let Some(conn) = shared.take_active_conn() {
+                if let Some(transport) = shared.take_active_transport() {
+                    let conn = transport.conn;
                     let locally_initiated = conn.close_reason().is_none();
                     conn.close(quinn::VarInt::from_u32(0), b"client-stop");
                     if locally_initiated {
@@ -252,11 +301,11 @@ pub(crate) async fn run(shared: Arc<EngineShared>, mut packet_in_rx: mpsc::Recei
                 // Permanent errors (token, version, config) are not healed by retries.
                 if cause.is_permanent() {
                     tracing::warn!(%cause, "permanent error: engine stopped");
-                    shared.set_active_conn(None);
+                    shared.take_active_transport();
                     shared.set_state(TunnelState::Stopped);
                     return;
                 }
-                shared.set_active_conn(None);
+                shared.take_active_transport();
                 if established {
                     // The session was working: retry fast, count a reconnect.
                     tracing::info!(%cause, "session dropped: reconnecting");

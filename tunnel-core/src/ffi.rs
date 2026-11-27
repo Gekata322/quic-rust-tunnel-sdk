@@ -281,10 +281,13 @@ impl TunnelClient {
             .ok()
     }
 
-    /// Network change hint (Wi-Fi ↔ cellular): the active QUIC connection is
-    /// closed and the engine immediately reconnects on the new interface.
+    /// Network change hint (Wi-Fi ↔ cellular, NAT rebinding): the active QUIC
+    /// connection migrates to a fresh UDP socket (RFC 9000 connection
+    /// migration) — the session, its VIP and the data queues survive. A full
+    /// reconnect runs only when there is no established session (the retry
+    /// loop handles it) or the migration socket could not be set up.
     pub fn on_network_changed(&self) {
-        self.shared.force_reconnect();
+        self.shared.migrate();
     }
 }
 

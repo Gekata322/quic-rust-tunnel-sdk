@@ -28,7 +28,7 @@ use tunnel_proto::{
     Welcome, PROTOCOL_VERSION,
 };
 
-use crate::engine::{EngineShared, wait_stopping};
+use crate::engine::{ActiveTransport, EngineShared, wait_stopping};
 use crate::error::CoreError;
 use crate::ffi::{TunnelConfig, TunnelState};
 
@@ -67,9 +67,11 @@ enum PlaneEnd {
     ConnClosed(String),
 }
 
-/// An established session: the connection, control streams and server parameters.
+/// An established session: the connection, its endpoint (for migration), the
+/// control streams and the server parameters.
 struct Established {
     conn: quinn::Connection,
+    endpoint: quinn::Endpoint,
     control: ControlStreams,
     welcome: Welcome,
 }
@@ -135,7 +137,7 @@ async fn establish(
         .await
         .map_err(|_| CoreError::TimedOut("protocol handshake did not finish".to_owned()))??;
 
-    Ok(Established { conn, control, welcome })
+    Ok(Established { conn, endpoint, control, welcome })
 }
 
 /// Runs the established session: publishes state, runs both planes, closes cleanly.
@@ -144,12 +146,15 @@ async fn run_established(
     session: Established,
     packet_in_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> SessionOutcome {
-    let Established { conn, control, welcome } = session;
+    let Established { conn, endpoint, control, welcome } = session;
 
     tracing::info!(vip = %welcome.vip, mtu = welcome.mtu, "session established");
     shared.metrics.record_session_established();
     shared.reset_ping();
-    shared.set_active_conn(Some(conn.clone()));
+    shared.set_active_transport(ActiveTransport {
+        conn: conn.clone(),
+        endpoint,
+    });
     shared.set_state(TunnelState::Connected {
         mtu: welcome.mtu,
         vip: welcome.vip.to_string(),
