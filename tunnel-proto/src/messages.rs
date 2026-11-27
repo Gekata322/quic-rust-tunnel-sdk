@@ -195,7 +195,9 @@ mod tests {
         // A buffer cut mid-message is an incomplete read, not an error.
         for cut in [0, 2, 4, full.len() - 1] {
             assert!(
-                decode_control::<ControlFromClient>(&full[..cut]).expect("no error").is_none(),
+                decode_control::<ControlFromClient>(&full[..cut])
+                    .expect("no error")
+                    .is_none(),
                 "cut at {cut} must decode to None"
             );
         }
@@ -230,7 +232,7 @@ mod tests {
         let (value, used) = decode_control::<ControlFromServer>(&extended)
             .expect("valid frame")
             .expect("buffer is complete");
-        assert!(matches!(value, ControlFromServer::Reject(Reject { .. }))); 
+        assert!(matches!(value, ControlFromServer::Reject(Reject { .. })));
         assert_eq!(used + 4, full.len(), "exactly the frame body is consumed");
     }
 }

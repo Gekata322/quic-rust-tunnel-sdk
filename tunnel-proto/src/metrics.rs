@@ -94,7 +94,11 @@ mod tests {
     #[test]
     fn counters_accumulate_into_an_independent_snapshot() {
         let metrics = Metrics::default();
-        assert_eq!(metrics.snapshot(), MetricsSnapshot::default(), "fresh counters are zero");
+        assert_eq!(
+            metrics.snapshot(),
+            MetricsSnapshot::default(),
+            "fresh counters are zero"
+        );
 
         metrics.record_bytes_sent(100);
         metrics.record_bytes_received(50);

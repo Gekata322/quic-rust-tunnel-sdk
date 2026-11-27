@@ -74,7 +74,9 @@ mod tests {
 
     #[test]
     fn roundtrip_is_zero_copy() {
-        let payload = [0x45u8, 0, 0, 8, 0, 1, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let payload = [
+            0x45u8, 0, 0, 8, 0, 1, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
         let datagram = Bytes::from(encode_frame(KIND_IPV4, &payload));
         let frame = decode_frame_zero_copy(&datagram).expect("valid frame");
         assert_eq!(frame.kind, KIND_IPV4);
@@ -93,7 +95,10 @@ mod tests {
 
     #[test]
     fn empty_and_unknown_kinds_are_rejected() {
-        assert_eq!(decode_frame_zero_copy(&Bytes::new()), Err(FrameError::Empty));
+        assert_eq!(
+            decode_frame_zero_copy(&Bytes::new()),
+            Err(FrameError::Empty)
+        );
         // Kind 0 is not a valid IP version either.
         assert_eq!(
             decode_frame_zero_copy(&Bytes::from_static(&[0, 1])),
@@ -113,8 +118,8 @@ mod tests {
             Err(FrameError::PayloadTooLarge(MAX_DATAGRAM_PAYLOAD + 1))
         );
         let at_limit = vec![0u8; MAX_DATAGRAM_PAYLOAD];
-        let frame =
-            decode_frame_zero_copy(&Bytes::from(encode_frame(KIND_IPV4, &at_limit))).expect("at the limit is fine");
+        let frame = decode_frame_zero_copy(&Bytes::from(encode_frame(KIND_IPV4, &at_limit)))
+            .expect("at the limit is fine");
         assert_eq!(frame.payload.len(), MAX_DATAGRAM_PAYLOAD);
     }
 }

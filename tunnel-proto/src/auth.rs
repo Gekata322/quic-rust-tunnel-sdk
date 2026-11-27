@@ -102,7 +102,10 @@ mod tests {
         assert!(store.verify("partner-a", "tok-1"));
         assert!(store.verify("partner-b", "tok-2"));
         assert!(!store.verify("partner-a", "tok-2"), "wrong token");
-        assert!(!store.verify("unknown", "tok-1"), "unknown id must not leak via timing hints");
+        assert!(
+            !store.verify("unknown", "tok-1"),
+            "unknown id must not leak via timing hints"
+        );
         assert!(!store.verify("", ""), "empty values");
         // A matching token prefix must not authenticate: comparison is exact.
         assert!(!store.verify("partner-a", "tok"));

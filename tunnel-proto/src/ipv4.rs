@@ -86,7 +86,8 @@ mod tests {
 
     #[test]
     fn parse_valid_packet() {
-        let header = parse(&packet([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE, 0xAD])).expect("valid packet");
+        let header =
+            parse(&packet([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE, 0xAD])).expect("valid packet");
         assert_eq!(header.version, 4);
         assert_eq!(header.src, [10, 66, 0, 2]);
         assert_eq!(header.dst, [10, 66, 0, 1]);
@@ -96,11 +97,17 @@ mod tests {
 
     #[test]
     fn parse_rejects_short_and_non_ipv4_buffers() {
-        assert!(parse(&[0x45, 0, 0, 20]).is_none(), "4 bytes are not a header");
+        assert!(
+            parse(&[0x45, 0, 0, 20]).is_none(),
+            "4 bytes are not a header"
+        );
         assert!(parse(&[]).is_none());
         let mut pkt = packet([1, 2, 3, 4], [5, 6, 7, 8], b"x");
         pkt[0] = 0x65; // version 6
-        assert!(parse(&pkt).is_none(), "version 6 is not handled by the IPv4 parser");
+        assert!(
+            parse(&pkt).is_none(),
+            "version 6 is not handled by the IPv4 parser"
+        );
     }
 
     #[test]
@@ -115,10 +122,16 @@ mod tests {
         let mut pkt = packet([1, 2, 3, 4], [5, 6, 7, 8], &[0u8; 40]);
         // total_len = 20 with a 60-byte buffer: truncated payload is valid.
         pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
-        assert!(parse(&pkt).is_some(), "a buffer longer than total_len is fine");
+        assert!(
+            parse(&pkt).is_some(),
+            "a buffer longer than total_len is fine"
+        );
         // total_len beyond the buffer is a contradiction.
         pkt[2..4].copy_from_slice(&6200u16.to_be_bytes());
-        assert!(parse(&pkt).is_none(), "total_len beyond the buffer is garbage");
+        assert!(
+            parse(&pkt).is_none(),
+            "total_len beyond the buffer is garbage"
+        );
         // total_len below the header length is a contradiction too.
         pkt[2..4].copy_from_slice(&8u16.to_be_bytes());
         assert!(parse(&pkt).is_none());
