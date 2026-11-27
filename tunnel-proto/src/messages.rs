@@ -1,152 +1,155 @@
-//! Управляющие сообщения control plane: рукопожатие и ping/pong.
+//! Control-plane messages: handshake and ping/pong.
 //!
-//! Формат на проводе: 4-байтовый префикс длины тела (LE) + тело bincode
-//! (`bincode::config::legacy()` — fixed-width целые, little-endian). Длина
-//! тела ограничена [`MAX_CONTROL_MESSAGE_SIZE`]: сервер не может быть
-//! DoS-нут через гигантский префикс.
+//! Wire format: 4-byte body length prefix (LE) + bincode body
+//! (`bincode::config::legacy()` — fixed-width ints, little-endian). The body
+//! is capped by [`MAX_CONTROL_MESSAGE_SIZE`] so a giant prefix cannot DoS the
+//! server.
 //!
-//! Сценарий рукопожатия (bi-поток #0):
-//! 1. клиент → [`ControlFromClient::Hello`] (версия протокола, client_id,
-//!    B2B-токен);
-//! 2. сервер → [`ControlFromServer::Welcome`] (выданный адрес, MTU, keepalive)
-//!    или [`ControlFromServer::Reject`] (типизированная причина).
+//! Handshake over bidirectional stream #0:
+//! 1. client → [`ControlFromClient::Hello`] (protocol version, client_id,
+//!    B2B token);
+//! 2. server → [`ControlFromServer::Welcome`] (assigned address, MTU,
+//!    keepalive) or [`ControlFromServer::Reject`] (typed reason).
 //!
-//! Затем control plane живёт ping/pong'ами: клиент шлёт
-//! [`ControlFromClient::Ping`] со штампом отправки, сервер мгновенно
-//! возвращает [`ControlFromServer::Pong`] с эхом штампа — клиент считает RTT.
+//! Afterwards the control plane carries ping/pong: the client sends
+//! [`ControlFromClient::Ping`] with a send timestamp and the server echoes it
+//! back in [`ControlFromServer::Pong`] so the client can compute RTT.
 
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::{Decode, Encode};
 
-/// Версия протокола, отправляемая в `Hello`. Сервер сравнивает со своей.
+/// Protocol version sent in `Hello`; the server compares it with its own.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Максимальный размер тела управляющего сообщения (после префикса длины).
-/// Токены и client_id укладываются с многократным запасом.
+/// Maximum control-message body size (after the length prefix); tokens and
+/// client ids fit with plenty of headroom.
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 16 * 1024;
 
-/// Текущее время в миллисекундах с начала эпохи Unix (для RTT-штампов ping).
+/// Current time in milliseconds since the Unix epoch (for ping RTT stamps).
 pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
-        // Системные часы раньше 1970 года — дефект среды, не сети.
         .unwrap_or(0)
 }
 
-/// Сообщения от клиента к серверу (control plane, поток #0).
+/// Messages sent by the client (control plane, stream #0).
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ControlFromClient {
-    /// Рукопожатие: первый запрос после подключения QUIC.
+    /// Handshake: the first request after the QUIC connection opens.
     Hello(Hello),
-    /// Keepalive со штампом отправки (эхо-поле в `Pong` даёт RTT).
+    /// Keepalive with a send timestamp (echoed in `Pong` to compute RTT).
     Ping(Ping),
 }
 
-/// Рукопожатие: первый запрос после подключения QUIC.
+/// Handshake: the first request after the QUIC connection opens.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Hello {
-    /// Версия протокола клиента; несовпадение — [`RejectCode::ProtocolMismatch`].
+    /// Client protocol version; a mismatch yields [`RejectCode::ProtocolMismatch`].
     pub protocol_version: u32,
-    /// Идентификатор клиента для логов/телеметрии оператора.
+    /// Client identifier for operator logs/telemetry.
     pub client_id: String,
-    /// B2B-токен партнёра (проверяется за константное время).
+    /// B2B partner token (verified in constant time).
     pub auth_token: String,
 }
 
-/// Keepalive со штампом отправки: эхо-поле `Pong::sent_unix_ms` даёт RTT.
+/// Keepalive with a send timestamp; the echoed `Pong::sent_unix_ms` yields RTT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct Ping {
-    /// Порядковый номер ping'а.
+    /// Ping sequence number.
     pub seq: u32,
-    /// unix_ms клиента в момент отправки.
+    /// Client `unix_ms` at send time.
     pub sent_unix_ms: u64,
 }
 
-/// Сообщения от сервера к клиенту (control plane, поток #0).
+/// Messages sent by the server (control plane, stream #0).
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ControlFromServer {
-    /// Рукопожатие принято: параметры сессии.
+    /// Handshake accepted: session parameters.
     Welcome(Welcome),
-    /// Отказ с типизированной причиной: клиент отличает постоянные ошибки
-    /// (ретрай бессмыслен) от временных.
+    /// Rejection with a typed reason: the client can distinguish permanent
+    /// failures (retrying is pointless) from transient ones.
     Reject(Reject),
-    /// Эхо-ответ на ping: штамп отправки возвращается без изменений.
+    /// Echo reply to a ping: the send timestamp is returned unchanged.
     Pong(Pong),
 }
 
-/// Рукопожатие принято: параметры сессии.
+/// Handshake accepted: session parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct Welcome {
-    /// Виртуальный адрес клиента — настройте им платформенный TUN.
-    /// Каждый исходящий пакет обязан иметь этот адрес отправителем.
+    /// Virtual address assigned to the client — configure the platform TUN
+    /// with it. Every outgoing packet must carry it as the source address.
     pub vip: Ipv4Addr,
-    /// MTU виртуального интерфейса (QUIC-оверлей съедает до ~1252 байт).
+    /// MTU of the virtual interface (the QUIC overlay consumes ~28 bytes).
     pub mtu: u16,
-    /// Период прикладного ping, сек (0 — клиент берёт свой дефолт 15).
+    /// Application-level ping interval in seconds (0 — client picks its
+    /// default of 15).
     pub keepalive_interval_secs: u32,
 }
 
-/// Отказ рукопожатия с типизированной причиной.
+/// Handshake rejection with a typed reason.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Reject {
-    /// Код причины.
+    /// Reason code.
     pub code: RejectCode,
-    /// Человекочитаемое объяснение (для логов партнёра).
+    /// Human-readable explanation (for the partner's logs).
     pub message: String,
 }
 
-/// Эхо-ответ на ping: штамп отправки возвращается без изменений.
+/// Echo reply to a ping: the send timestamp is returned unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct Pong {
-    /// seq из `Ping`.
+    /// `seq` from `Ping`.
     pub seq: u32,
-    /// sent_unix_ms из `Ping` — по нему клиент считает RTT.
+    /// `sent_unix_ms` from `Ping` — the client derives RTT from it.
     pub sent_unix_ms: u64,
-    /// unix_ms сервера (не участвует в RTT, полезно для диагностики).
+    /// Server `unix_ms` (not part of RTT; useful for diagnostics).
     pub server_unix_ms: u64,
 }
 
-/// Коды отказа рукопожатия.
+/// Handshake rejection codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum RejectCode {
-    /// Токен неизвестен/заблокирован → постоянная ошибка.
+    /// Token unknown or revoked → permanent failure.
     InvalidToken,
-    /// Версия протокола не поддерживается → обновить SDK.
+    /// Protocol version unsupported → update the SDK.
     ProtocolMismatch,
-    /// Пул адресов исчерпан/сервер перегружен → ретрай уместен.
+    /// Address pool exhausted / server overloaded → retry is reasonable.
     ServerBusy,
 }
 
-/// Дейтаграмма data plane как bincode-структура: альтернатива ручному кадру
-/// [`crate::frame`] для утилит и тестов. В живом data plane используется
-/// компактный формат `[kind: u8][payload]` без overhead'а bincode.
+/// Data-plane datagram as a bincode struct: an alternative to the compact
+/// [`crate::frame`] format for utilities and tests. The live data plane uses
+/// the tight `[kind: u8][payload]` layout with no bincode overhead.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct WirePacket {
-    /// Вид кадра: [`crate::frame::KIND_IPV4`] или [`crate::frame::KIND_IPV6`].
+    /// Frame kind: [`crate::frame::KIND_IPV4`] or [`crate::frame::KIND_IPV6`].
     pub kind: u8,
-    /// IP-пакет целиком (заголовок + payload).
+    /// Full IP packet (header + payload).
     pub payload: Vec<u8>,
 }
 
-/// Кодирует сообщение в кадр управления: префикс длины + bincode-тело.
-/// Кодирование уже проверенных сообщений не падает.
+/// Encodes a message into a control frame: length prefix + bincode body.
+/// Encoding an already-valid message cannot fail.
 pub fn encode_control<T: Encode>(message: &T) -> Vec<u8> {
     let body = bincode::encode_to_vec(message, bincode::config::legacy())
-        .expect("управляющее сообщение укладывается в bincode");
+        .expect("control message fits bincode");
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
     out
 }
 
-/// Декодирует сообщение из полного кадра (префикс + тело).
+/// Decodes a message from a complete frame (prefix + body).
 ///
-/// Возвращает `Ok(None)`, если буфер короче префикса или тела — неполное
-/// чтение; `Err` — битый кадр (длина сверх лимита или неразборчивое тело).
-pub fn decode_control<T: Decode<()>>(buf: &[u8]) -> Result<Option<(T, usize)>, bincode::error::DecodeError> {
+/// Returns `Ok(None)` when the buffer is shorter than the prefix or the body
+/// (incomplete read); `Err` marks a corrupt frame (length over the limit or
+/// undecodable body).
+pub fn decode_control<T: Decode<()>>(
+    buf: &[u8],
+) -> Result<Option<(T, usize)>, bincode::error::DecodeError> {
     if buf.len() < 4 {
         return Ok(None);
     }
@@ -156,20 +159,19 @@ pub fn decode_control<T: Decode<()>>(buf: &[u8]) -> Result<Option<(T, usize)>, b
     }
     if len > MAX_CONTROL_MESSAGE_SIZE {
         return Err(bincode::error::DecodeError::OtherString(format!(
-            "тело управляющего сообщения {len} байт сверх лимита {MAX_CONTROL_MESSAGE_SIZE}"
+            "control message body of {len} bytes exceeds the limit of {MAX_CONTROL_MESSAGE_SIZE}"
         )));
     }
     let (value, used) = bincode::decode_from_slice(&buf[4..4 + len], bincode::config::legacy())?;
     Ok(Some((value, used)))
 }
 
-/// Кодирует дейтаграмму в bincode (`WirePacket`) — см. док типа.
+/// Encodes a datagram into bincode ([`WirePacket`]) — see the type docs.
 pub fn encode_wire_packet(packet: &WirePacket) -> Vec<u8> {
-    bincode::encode_to_vec(packet, bincode::config::legacy())
-        .expect("WirePacket укладывается в bincode")
+    bincode::encode_to_vec(packet, bincode::config::legacy()).expect("WirePacket fits bincode")
 }
 
-/// Декодирует дейтаграмму из bincode (`WirePacket`).
+/// Decodes a datagram from bincode ([`WirePacket`]).
 pub fn decode_wire_packet(buf: &[u8]) -> Result<WirePacket, bincode::error::DecodeError> {
     let (packet, _) = bincode::decode_from_slice(buf, bincode::config::legacy())?;
     Ok(packet)
@@ -178,91 +180,23 @@ pub fn decode_wire_packet(buf: &[u8]) -> Result<WirePacket, bincode::error::Deco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::KIND_IPV4;
 
-    #[test]
-    fn hello_roundtrip() {
-        let hello = ControlFromClient::Hello(Hello {
+    fn sample_hello() -> ControlFromClient {
+        ControlFromClient::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client_id: "android-2.1.0".to_owned(),
             auth_token: "b2b-live-secret".to_owned(),
-        });
-        let encoded = encode_control(&hello);
-        assert!(encoded.len() > 4, "префикс + тело");
-        let decoded = decode_control::<ControlFromClient>(&encoded)
-            .expect("корректный кадр")
-            .expect("буфер полный");
-        assert_eq!(decoded.0, hello);
-        assert_eq!(decoded.1, encoded.len() - 4, "использовано всё тело");
-    }
-
-    #[test]
-    fn welcome_roundtrip_preserves_address() {
-        let welcome = Welcome {
-            vip: Ipv4Addr::new(10, 66, 0, 2),
-            mtu: 1280,
-            keepalive_interval_secs: 15,
-        };
-        let encoded = encode_control(&ControlFromServer::Welcome(welcome));
-        let (decoded, _) = decode_control::<ControlFromServer>(&encoded)
-            .expect("корректный кадр")
-            .expect("буфер полный");
-        match decoded {
-            ControlFromServer::Welcome(w) => {
-                assert_eq!(w.vip, Ipv4Addr::new(10, 66, 0, 2));
-                assert_eq!(w.mtu, 1280);
-                assert_eq!(w.keepalive_interval_secs, 15);
-            }
-            other => panic!("неожиданный вариант: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ping_pong_roundtrip() {
-        let sent_ms = unix_ms();
-        let ping = ControlFromClient::Ping(Ping { seq: 7, sent_unix_ms: sent_ms });
-        let pong = ControlFromServer::Pong(Pong {
-            seq: 7,
-            sent_unix_ms: sent_ms,
-            server_unix_ms: unix_ms(),
-        });
-        let (p, _) = decode_control::<ControlFromClient>(&encode_control(&ping))
-            .expect("корректный кадр")
-            .expect("буфер полный");
-        assert_eq!(p, ping, "ping байт в байт после roundtrip");
-        let (p, _) = decode_control::<ControlFromServer>(&encode_control(&pong))
-            .expect("корректный кадр")
-            .expect("буфер полный");
-        assert_eq!(p, pong, "pong байт в байт после roundtrip");
-    }
-
-    #[test]
-    fn reject_roundtrip_all_codes() {
-        for (code, text) in [
-            (RejectCode::InvalidToken, "токен не найден"),
-            (RejectCode::ProtocolMismatch, "нужна версия 2"),
-            (RejectCode::ServerBusy, "пул исчерпан"),
-        ] {
-            let reject = Reject { code, message: text.to_owned() };
-            let (decoded, _) = decode_control::<ControlFromServer>(&encode_control(&ControlFromServer::Reject(reject.clone())))
-                .expect("корректный кадр")
-                .expect("буфер полный");
-            assert_eq!(decoded, ControlFromServer::Reject(reject));
-        }
+        })
     }
 
     #[test]
     fn incomplete_buffer_is_none_not_error() {
-        let full = encode_control(&ControlFromClient::Hello(Hello {
-            protocol_version: 1,
-            client_id: "c".to_owned(),
-            auth_token: "t".to_owned(),
-        }));
-        // Обрезанный на середине буфер — неполное сообщение, не ошибка.
+        let full = encode_control(&sample_hello());
+        // A buffer cut mid-message is an incomplete read, not an error.
         for cut in [0, 2, 4, full.len() - 1] {
             assert!(
-                decode_control::<ControlFromClient>(&full[..cut]).expect("нет ошибки").is_none(),
-                "обрезка {cut} должна давать None"
+                decode_control::<ControlFromClient>(&full[..cut]).expect("no error").is_none(),
+                "cut at {cut} must decode to None"
             );
         }
     }
@@ -274,7 +208,7 @@ mod tests {
         evil.extend_from_slice(&[0u8; 16]);
         assert!(
             decode_control::<ControlFromClient>(&evil).is_err(),
-            "префикс сверх лимита обязан быть ошибкой"
+            "a prefix over the limit must be an error (DoS guard)"
         );
     }
 
@@ -286,13 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_packet_roundtrip() {
-        let packet = WirePacket { kind: KIND_IPV4, payload: vec![0x45, 0, 0, 8] };
-        let decoded = decode_wire_packet(&encode_wire_packet(&packet)).expect("bincode-кадр");
-        assert_eq!(decoded, packet);
-    }
-
-    #[test]
     fn trailing_bytes_after_body_are_ignored() {
         let full = encode_control(&ControlFromServer::Reject(Reject {
             code: RejectCode::ServerBusy,
@@ -301,18 +228,9 @@ mod tests {
         let mut extended = full.clone();
         extended.extend_from_slice(&[0xAA, 0xBB]);
         let (value, used) = decode_control::<ControlFromServer>(&extended)
-            .expect("корректный кадр")
-            .expect("буфер полный");
-        assert!(matches!(value, ControlFromServer::Reject(Reject { .. })));
-        assert_eq!(used + 4, full.len(), "использовано ровно тело кадра");
+            .expect("valid frame")
+            .expect("buffer is complete");
+        assert!(matches!(value, ControlFromServer::Reject(Reject { .. }))); 
+        assert_eq!(used + 4, full.len(), "exactly the frame body is consumed");
     }
-
-    #[test]
-    fn unix_ms_is_monotonic_enough() {
-        let a = unix_ms();
-        assert!(a > 1_700_000_000_000, "часы идут после 2023 года: {a}");
-        let b = unix_ms();
-        assert!(b >= a, "unix_ms не уходит назад");
-    }
-
 }

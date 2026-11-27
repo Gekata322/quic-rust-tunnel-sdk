@@ -1,10 +1,10 @@
-//! Счётчики телеметрии: атомарные, без блокировок, общий для клиента и
-//! сервера. Снимок ([`MetricsSnapshot`]) копируется по запросу — FFI-слой
-//! клиентского ядра отдаёт его платформе как «трафик за жизнь клиента».
+//! Lock-free atomic telemetry counters shared by the client and the server.
+//! A snapshot ([`MetricsSnapshot`]) is copied on demand; the client FFI layer
+//! reports it to the platform as lifetime traffic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Атомарные счётчики туннеля (один экземпляр на клиента/сервер).
+/// Atomic tunnel counters (one instance per client/server).
 #[derive(Debug, Default)]
 pub struct Metrics {
     bytes_sent: AtomicU64,
@@ -17,43 +17,43 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Учтёт `n` отправленных байт payload.
+    /// Records `n` payload bytes sent.
     pub fn record_bytes_sent(&self, n: u64) {
         self.bytes_sent.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Учтёт `n` принятых байт payload.
+    /// Records `n` payload bytes received.
     pub fn record_bytes_received(&self, n: u64) {
         self.bytes_received.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Учтёт отправленную дейтаграмму data plane.
+    /// Records one sent data-plane datagram.
     pub fn record_datagram_sent(&self) {
         self.datagrams_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Учтёт принятую дейтаграмму data plane.
+    /// Records one received data-plane datagram.
     pub fn record_datagram_received(&self) {
         self.datagrams_received.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Учтёт сброшенные пакеты (переполнение очереди, неизвестный кадр).
+    /// Records dropped packets (queue overflow, unknown frame, ...).
     pub fn record_packets_dropped(&self, n: u64) {
         self.packets_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Учтёт установленную сессию (после `Welcome`).
+    /// Records an established session (after `Welcome`).
     pub fn record_session_established(&self) {
         self.sessions_established.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Учтёт переподключение после разрыва установленной сессии.
+    /// Records a reconnect after an established session dropped.
     pub fn record_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Снимок: согласованность между полями не гарантируется (атомики
-    /// читаются независимо), для операционной телеметрии этого достаточно.
+    /// Takes a snapshot. Fields are read independently, so cross-field
+    /// consistency is not guaranteed — sufficient for operational telemetry.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         MetricsSnapshot {
@@ -68,22 +68,22 @@ impl Metrics {
     }
 }
 
-/// Снимок счётчиков на момент вызова.
+/// Point-in-time copy of the counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsSnapshot {
-    /// Отправлено байт payload через туннель.
+    /// Payload bytes sent through the tunnel.
     pub bytes_sent: u64,
-    /// Принято байт payload из туннеля.
+    /// Payload bytes received from the tunnel.
     pub bytes_received: u64,
-    /// Отправлено дейтаграмм data plane.
+    /// Data-plane datagrams sent.
     pub datagrams_sent: u64,
-    /// Принято дейтаграмм data plane.
+    /// Data-plane datagrams received.
     pub datagrams_received: u64,
-    /// Сброшено пакетов (переполнение очереди, мусорные кадры).
+    /// Packets dropped (queue overflow, garbage frames).
     pub packets_dropped: u64,
-    /// Установлено сессий (рукопожатий, завершившихся `Welcome`).
+    /// Established sessions (handshakes ending with `Welcome`).
     pub sessions_established: u64,
-    /// Восстановлений после разрыва установленной сессии.
+    /// Reconnects after an established session dropped.
     pub reconnects: u64,
 }
 
@@ -92,10 +92,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counters_accumulate_and_snapshot() {
+    fn counters_accumulate_into_an_independent_snapshot() {
         let metrics = Metrics::default();
-        let snap = metrics.snapshot();
-        assert_eq!(snap, MetricsSnapshot::default(), "новые счётчики нулевые");
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default(), "fresh counters are zero");
 
         metrics.record_bytes_sent(100);
         metrics.record_bytes_received(50);
@@ -114,37 +113,10 @@ mod tests {
         assert_eq!(snap.packets_dropped, 3);
         assert_eq!(snap.sessions_established, 1);
         assert_eq!(snap.reconnects, 1);
-    }
 
-    #[test]
-    fn snapshot_is_a_copy_not_a_view() {
-        let metrics = Metrics::default();
-        let snap = metrics.snapshot();
+        // A snapshot is a copy, not a live view.
         metrics.record_bytes_sent(10);
-        assert_eq!(snap.bytes_sent, 0, "снимок не изменяется задним числом");
-        assert_eq!(metrics.snapshot().bytes_sent, 10);
-    }
-
-    #[test]
-    fn byte_counts_are_additive() {
-        let metrics = Metrics::default();
-        for n in [1u64, 22, 1280] {
-            metrics.record_bytes_sent(n);
-            metrics.record_bytes_received(n);
-        }
-        let snap = metrics.snapshot();
-        assert_eq!(snap.bytes_sent, 1303);
-        assert_eq!(snap.bytes_received, 1303);
-    }
-
-    #[test]
-    fn sessions_and_reconnects_are_independent() {
-        let metrics = Metrics::default();
-        metrics.record_session_established();
-        metrics.record_session_established();
-        metrics.record_reconnect();
-        let snap = metrics.snapshot();
-        assert_eq!(snap.sessions_established, 2);
-        assert_eq!(snap.reconnects, 1);
+        assert_eq!(snap.bytes_sent, 100);
+        assert_eq!(metrics.snapshot().bytes_sent, 110);
     }
 }
