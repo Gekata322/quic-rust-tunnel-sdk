@@ -1,17 +1,19 @@
-//! Состояние сервера и обработка сессий клиентов.
+//! Server state and client session handling.
 //!
-//! Поток сессии (см. `endpoint::accept_loop` → `handle_connection`):
-//! 1. bi-поток #0: `Hello{version, client_id, token}` → проверка версии
-//!    протокола и токена ([`tunnel_proto::auth::TokenStore::verify`]);
-//! 2. выдача адреса из [`IpPool`], регистрация в [`RoutingTable`];
-//! 3. `Welcome{vip, mtu, keepalive}`; далее — control plane (`Ping → Pong`
-//!    по потоку #0) и data plane (дейтаграммы):
-//!    - **анти-спуфинг**: пакет с `src != выданному адресу` — дроп;
-//!    - loopback-режим: пакет на `server_vip` эхоится обратно с обменом адресов;
-//!    - боевой режим: пакет клиента пишется в TUN, пакеты из TUN
-//!      маршрутизируются клиенту по адресу получателя.
+//! Session flow (see `endpoint::accept_loop` → `handle_connection`):
+//! 1. bi-stream #0: `Hello{version, client_id, token}` → protocol version and
+//!    token verification ([`tunnel_proto::auth::TokenStore::verify`]);
+//! 2. an address is issued from the [`IpPool`], the client is registered in
+//!    the [`RoutingTable`];
+//! 3. `Welcome{vip, mtu, keepalive}`; then the control plane (`Ping → Pong`
+//!    over stream #0) and the data plane (datagrams):
+//!    - **anti-spoofing**: a packet with `src != the assigned address` is dropped;
+//!    - loopback mode: a packet to `server_vip` is echoed back with the
+//!      addresses swapped;
+//!    - production mode: a client packet is written to the TUN; packets from
+//!      the TUN are routed to the client by the destination address.
 //!
-//! Адрес возвращается в пул при любом завершении сессии — переиспользование.
+//! The address is returned to the pool on every session end — reuse.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -34,47 +36,58 @@ use crate::pool::IpPool;
 use crate::routing::RoutingTable;
 use crate::tun::TunDevice;
 
-/// Тайм-аут рукопожатия: клиент обязан прислать `Hello` и дождаться ответа.
+/// Handshake timeout: the client must send `Hello` and wait for the answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Длина очереди «сервер → клиент» (дейтаграммы из TUN/других клиентов).
+/// Length of the "server → client" queue (datagrams from the TUN/other clients).
 const OUTBOUND_QUEUE_LEN: usize = 256;
 
-/// Ошибки подъёма состояния сервера.
+/// Server state startup errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// Подсеть пула недействительна.
-    #[error("пул адресов: {0}")]
+    /// The pool subnet is invalid.
+    #[error("address pool: {0}")]
     Pool(#[from] crate::pool::PoolError),
 
-    /// TUN-интерфейс не поднялся.
-    #[error("TUN-интерфейс: {0}")]
+    /// The TUN interface did not come up.
+    #[error("TUN interface: {0}")]
     Tun(#[from] std::io::Error),
 }
 
-/// Общее состояние сервера: общий для всех сессий.
-/// Поля `server_vip` и `metrics` видны тестам и операционному коду.
+/// Errors while reading a control frame from a QUIC stream.
+#[derive(Debug, thiserror::Error)]
+enum ControlReadError {
+    /// The stream ended or the connection dropped mid-frame.
+    #[error("control stream closed: {0}")]
+    Stream(#[from] quinn::ReadExactError),
+    /// The frame body exceeds [`MAX_CONTROL_MESSAGE_SIZE`] (DoS guard).
+    #[error("control message of {len} bytes exceeds the limit of {MAX_CONTROL_MESSAGE_SIZE}")]
+    Oversized { len: usize },
+}
+
+/// Shared server state: common to all sessions.
+/// The `server_vip` and `metrics` fields are visible to tests and operators.
 pub struct ServerShared {
-    /// Адрес сервера в подсети туннеля (первый адрес пула).
+    /// Server address inside the tunnel subnet (the first pool address).
     pub server_vip: Ipv4Addr,
-    /// Телеметрия сервера (байты, дейтаграммы, сессии).
+    /// Server telemetry (bytes, datagrams, sessions).
     pub metrics: Arc<Metrics>,
-    /// MTU виртуального интерфейса клиентов.
+    /// MTU of the clients' virtual interface.
     mtu: u16,
-    /// Период прикладного ping, передаваемый в `Welcome`.
+    /// Application ping period sent in `Welcome`.
     keepalive_interval_secs: u32,
-    /// Токены партнёров.
+    /// Partner tokens.
     tokens: TokenStore,
-    /// Пул виртуальных адресов.
+    /// Virtual address pool.
     pool: IpPool,
-    /// Таблица «адрес → клиент».
+    /// "Address → client" table.
     routing: RoutingTable,
-    /// TUN-интерфейс боевого режима (`None` — loopback).
+    /// TUN interface of production mode (`None` — loopback).
     tun: Option<Arc<TunDevice>>,
 }
 
 impl ServerShared {
-    /// Собирает состояние сервера: пул адресов из `config.pool`, токены,
-    /// опциональный TUN (боевой режим) или loopback.
+    /// Builds the server state: an address pool from `config.pool`, tokens,
+    /// an optional TUN (production mode) or loopback.
     pub fn new(
         config: &ServerConfig,
         tokens: TokenStore,
@@ -93,22 +106,22 @@ impl ServerShared {
         }))
     }
 
-    /// Есть ли TUN (боевой режим) или loopback.
+    /// Whether there is a TUN (production mode) or loopback.
     pub fn is_loopback(&self) -> bool {
         self.tun.is_none()
     }
 
-    /// Таблица маршрутизации (тесты и диагностика).
+    /// Routing table (tests and diagnostics).
     pub fn routing(&self) -> &RoutingTable {
         &self.routing
     }
 
-    /// Число активных клиентов.
+    /// Number of active clients.
     pub fn active_clients(&self) -> usize {
         self.routing.active()
     }
 
-    /// Запускает читателя TUN: пакеты из ядра → клиентам по `RoutingTable`.
+    /// Starts the TUN reader: packets from the kernel → clients by the `RoutingTable`.
     pub fn spawn_tun_reader(self: &Arc<Self>) {
         let Some(tun) = self.tun.clone() else { return };
         let shared = Arc::clone(self);
@@ -124,19 +137,19 @@ impl ServerShared {
                         match shared.routing.route(dst) {
                             Some(sender) => {
                                 if sender.send(packet).await.is_err() {
-                                    // Клиент уже мёртв: пакет теряется, таблицу
-                                    // почистит его задача сессии.
+                                    // The client is already dead: the packet is
+                                    // lost, its session task cleans up the table.
                                     shared.metrics.record_packets_dropped(1);
                                 }
                             }
                             None => {
-                                // Адрес не выдан никому: не наши пакеты.
+                                // The address was not issued to anyone: not our packets.
                                 shared.metrics.record_packets_dropped(1);
                             }
                         }
                     }
                     Err(err) => {
-                        tracing::error!(%err, "чтение TUN прервано — маршрутизация остановлена");
+                        tracing::error!(%err, "TUN read failed — routing stopped");
                         return;
                     }
                 }
@@ -145,71 +158,44 @@ impl ServerShared {
     }
 }
 
-/// Цикл жизни одной сессии: рукопожатие → плоскости → очистка.
+/// Lifecycle of one session: handshake → planes → cleanup.
 pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connection) {
     let peer = conn.remote_address();
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(err) => {
-            tracing::debug!(%peer, %err, "bi-поток рукопожатия не открылся");
+            tracing::debug!(%peer, %err, "the handshake bi-stream did not open");
             return;
         }
     };
 
-    // --- Рукопожатие: Hello → Welcome/Reject ---
-    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let buf = match read_control_message(&mut recv).await {
-            Ok(buf) => buf,
-            Err(message) => Err(Reject {
-                code: RejectCode::ProtocolMismatch,
-                message,
-            })?,
-        };
-        match decode_control::<ControlFromClient>(&buf) {
-            Ok(Some((ControlFromClient::Hello(Hello { protocol_version, client_id, auth_token }), _))) => {
-                Ok((protocol_version, client_id, auth_token))
-            }
-            Ok(Some((other, _))) => Err(Reject {
-                code: RejectCode::ProtocolMismatch,
-                message: format!("ожидали Hello, получили {other:?}"),
-            }),
-            Ok(None) => Err(Reject {
-                code: RejectCode::ProtocolMismatch,
-                message: "обрезанное сообщение рукопожатия".to_owned(),
-            }),
-            Err(err) => Err(Reject {
-                code: RejectCode::ProtocolMismatch,
-                message: format!("нечитаемое сообщение: {err}"),
-            }),
-        }
-    })
-    .await;
-
-    let (protocol_version, client_id, auth_token) = match handshake {
-        Ok(Ok(fields)) => fields,
+    // --- Handshake: Hello → Welcome/Reject ---
+    let hello = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_hello(&mut recv)).await {
+        Ok(Ok(hello)) => hello,
         Ok(Err(reject)) => {
             send_reject(&mut send, &conn, reject).await;
             return;
         }
         Err(_) => {
-            tracing::debug!(%peer, "рукопожатие не завершилось за {}с", HANDSHAKE_TIMEOUT.as_secs());
+            tracing::debug!(%peer, "handshake did not finish within {}s", HANDSHAKE_TIMEOUT.as_secs());
             return;
         }
     };
+    let Hello { protocol_version, client_id, auth_token } = hello;
 
     if protocol_version != PROTOCOL_VERSION {
         tracing::warn!(
             client_id = %client_id,
             got = protocol_version,
             want = PROTOCOL_VERSION,
-            "версия протокола не поддержана"
+            "unsupported protocol version"
         );
         send_reject(
             &mut send,
             &conn,
             Reject {
                 code: RejectCode::ProtocolMismatch,
-                message: format!("поддерживается версия протокола {PROTOCOL_VERSION}, обновите SDK"),
+                message: format!("protocol version {PROTOCOL_VERSION} is required; update the SDK"),
             },
         )
         .await;
@@ -217,13 +203,13 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
     }
 
     if !shared.tokens.verify(&client_id, &auth_token) {
-        tracing::warn!(client_id = %client_id, "токен отклонён — отказ");
+        tracing::warn!(client_id = %client_id, "token rejected — denying");
         send_reject(
             &mut send,
             &conn,
             Reject {
                 code: RejectCode::InvalidToken,
-                message: "токен не найден или заблокирован".to_owned(),
+                message: "token not found or revoked".to_owned(),
             },
         )
         .await;
@@ -233,13 +219,13 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
     let vip = match shared.pool.alloc() {
         Some(vip) => vip,
         None => {
-            tracing::warn!(client_id = %client_id, "пул виртуальных адресов исчерпан — отказ");
+            tracing::warn!(client_id = %client_id, "virtual address pool exhausted — denying");
             send_reject(
                 &mut send,
                 &conn,
                 Reject {
                     code: RejectCode::ServerBusy,
-                    message: "пул виртуальных адресов исчерпан, попробуйте позже".to_owned(),
+                    message: "virtual address pool exhausted, try again later".to_owned(),
                 },
             )
             .await;
@@ -247,7 +233,7 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
         }
     };
 
-    // --- Welcome и регистрация клиента ---
+    // --- Welcome and client registration ---
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_LEN);
     shared.routing.register(vip, outbound_tx.clone());
 
@@ -260,18 +246,30 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
         cleanup(&shared, vip, &outbound_tx);
         return;
     }
-    tracing::info!(client_id = %client_id, vip = %vip, "сессия установлена");
+    tracing::info!(client_id = %client_id, vip = %vip, "session established");
     shared.metrics.record_session_established();
 
-    // Задача отправки «сервер → клиент» (обратный трафик).
+    // The "server → client" send task (return traffic).
     let sender_task = tokio::spawn(send_loop(Arc::clone(&shared), conn.clone(), outbound_rx));
 
-    // --- Рабочий цикл: control plane + data plane ---
+    // --- Working loop: control plane + data plane ---
     loop {
         tokio::select! {
             biased;
             control = read_control_message(&mut recv) => match control {
+                Err(err) => {
+                    tracing::debug!(client_id = %client_id, %err, "control plane closed");
+                    break;
+                }
                 Ok(buf) => match decode_control::<ControlFromClient>(&buf) {
+                    Err(err) => {
+                        tracing::debug!(client_id = %client_id, %err, "malformed control message");
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(client_id = %client_id, "truncated control message");
+                        break;
+                    }
                     Ok(Some((ControlFromClient::Ping(Ping { seq, sent_unix_ms }), _))) => {
                         let pong = ControlFromServer::Pong(Pong {
                             seq,
@@ -283,57 +281,43 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
                         }
                     }
                     Ok(Some((other, _))) => {
-                        tracing::debug!(client_id = %client_id, ?other, "неожиданное управляющее сообщение");
-                    }
-                    Ok(None) => {
-                        tracing::debug!(client_id = %client_id, "обрезанное управляющее сообщение");
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::debug!(client_id = %client_id, %err, "битое управляющее сообщение");
-                        break;
+                        tracing::debug!(client_id = %client_id, ?other, "unexpected control message");
                     }
                 },
-                Err(err) => {
-                    tracing::debug!(client_id = %client_id, %err, "control plane закрыт");
-                    break;
-                }
             },
             datagram = conn.read_datagram() => match datagram {
-                Ok(datagram) => {
-                    match process_inbound(&shared, vip, &datagram) {
-                        PacketAction::Echo(reply) => {
-                            // Echo несёт чистый IP-пакет — кадрируем как data plane.
-                            if conn.send_datagram(Bytes::from(encode_frame(KIND_IPV4, &reply))).is_err() {
-                                break;
-                            }
+                Err(err) => {
+                    tracing::debug!(client_id = %client_id, %err, "data plane closed");
+                    break;
+                }
+                Ok(datagram) => match process_inbound(&shared, vip, &datagram) {
+                    PacketAction::Echo(reply) => {
+                        // Echo carries a raw IP packet — frame it as the data plane.
+                        if conn.send_datagram(Bytes::from(encode_frame(KIND_IPV4, &reply))).is_err() {
+                            break;
                         }
-                        PacketAction::Forward(packet) => {
-                            let Some(tun) = shared.tun.as_ref() else {
-                                tracing::debug!(client_id = %client_id, "пакет без TUN-маршрута — дроп");
-                                shared.metrics.record_packets_dropped(1);
-                                continue;
-                            };
-                            if let Err(err) = tun.write_packet(&packet).await {
-                                tracing::warn!(%err, "запись в TUN не удалась");
-                                shared.metrics.record_packets_dropped(1);
-                            }
-                        }
-                        PacketAction::RouteTo(sender, packet) => {
-                            if sender.send(packet).await.is_err() {
-                                shared.metrics.record_packets_dropped(1);
-                            }
-                        }
-                        PacketAction::Drop(reason) => {
-                            tracing::debug!(client_id = %client_id, reason, "пакет отброшен");
+                    }
+                    PacketAction::Forward(packet) => {
+                        let Some(tun) = shared.tun.as_ref() else {
+                            tracing::debug!(client_id = %client_id, "packet without a TUN route — dropped");
+                            shared.metrics.record_packets_dropped(1);
+                            continue;
+                        };
+                        if let Err(err) = tun.write_packet(&packet).await {
+                            tracing::warn!(%err, "failed to write to the TUN");
                             shared.metrics.record_packets_dropped(1);
                         }
                     }
-                }
-                Err(err) => {
-                    tracing::debug!(client_id = %client_id, %err, "data plane закрыт");
-                    break;
-                }
+                    PacketAction::RouteTo(sender, packet) => {
+                        if sender.send(packet).await.is_err() {
+                            shared.metrics.record_packets_dropped(1);
+                        }
+                    }
+                    PacketAction::Drop(reason) => {
+                        tracing::debug!(client_id = %client_id, reason, "packet dropped");
+                        shared.metrics.record_packets_dropped(1);
+                    }
+                },
             },
         }
     }
@@ -341,16 +325,18 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
     cleanup(&shared, vip, &outbound_tx);
     sender_task.abort();
     conn.close(quinn::VarInt::from_u32(0), b"session-end");
-    tracing::info!(client_id = %client_id, vip = %vip, "сессия завершена");
+    tracing::info!(client_id = %client_id, vip = %vip, "session finished");
 }
 
-/// Сколько ждём, пока клиент прочитает `Reject`, перед закрытием соединения.
+/// How long to wait while the client reads the `Reject` before closing the
+/// connection.
 const REJECT_DRAIN: Duration = Duration::from_millis(200);
 
-/// Отправляет `Reject` и дрейнит: без паузы CONNECTION_CLOSE обгоняет данные
-/// потока, клиент видит просто «connection lost» вместо причины отказа — и
-/// ретраит то, что ретраить бессмысленно. Завершаем send-направление (FIN) и
-/// ждём до `REJECT_DRAIN`, пока клиент закроет соединение сам.
+/// Sends a `Reject` and drains: without the pause CONNECTION_CLOSE overtakes
+/// the stream data, the client sees a bare "connection lost" instead of the
+/// rejection reason — and retries what cannot be retried. Finishes the send
+/// direction (FIN) and waits up to `REJECT_DRAIN` for the client to close the
+/// connection itself.
 async fn send_reject(send: &mut quinn::SendStream, conn: &quinn::Connection, reject: Reject) {
     let payload = encode_control(&ControlFromServer::Reject(reject));
     if send.write_all(&payload).await.is_ok() {
@@ -359,13 +345,38 @@ async fn send_reject(send: &mut quinn::SendStream, conn: &quinn::Connection, rej
     }
 }
 
-/// Возвращает адрес в пул и снимает маршрут.
+/// Reads and decodes `Hello` from the control stream, or builds the typed
+/// `Reject` reason. Every failure maps through `?`, keeping the flow flat.
+async fn read_hello(recv: &mut quinn::RecvStream) -> Result<Hello, Reject> {
+    let buf = read_control_message(recv).await.map_err(|err| Reject {
+        code: RejectCode::ProtocolMismatch,
+        message: err.to_string(),
+    })?;
+    let (message, _) = decode_control::<ControlFromClient>(&buf)
+        .map_err(|err| Reject {
+            code: RejectCode::ProtocolMismatch,
+            message: format!("unreadable message: {err}"),
+        })?
+        .ok_or_else(|| Reject {
+            code: RejectCode::ProtocolMismatch,
+            message: "truncated handshake message".to_owned(),
+        })?;
+    match message {
+        ControlFromClient::Hello(hello) => Ok(hello),
+        other => Err(Reject {
+            code: RejectCode::ProtocolMismatch,
+            message: format!("expected Hello, got {other:?}"),
+        }),
+    }
+}
+
+/// Returns the address to the pool and removes the route.
 fn cleanup(shared: &Arc<ServerShared>, vip: Ipv4Addr, outbound_tx: &mpsc::Sender<Vec<u8>>) {
     shared.routing.unregister(vip, outbound_tx);
     let _ = shared.pool.release(vip);
 }
 
-/// Задача отправки накопленных пакетов конкретному клиенту.
+/// Task sending queued packets to a concrete client.
 async fn send_loop(
     shared: Arc<ServerShared>,
     conn: quinn::Connection,
@@ -381,94 +392,90 @@ async fn send_loop(
                 shared.metrics.record_packets_dropped(1);
             }
             Err(quinn::SendDatagramError::ConnectionLost(err)) => {
-                tracing::debug!(%err, "соединение клиента потеряно — задача отправки завершена");
+                tracing::debug!(%err, "client connection lost — send task finished");
                 return;
             }
             Err(err) => {
                 shared.metrics.record_packets_dropped(1);
-                tracing::debug!(%err, "дейтаграмма не ушла клиенту");
+                tracing::debug!(%err, "datagram did not reach the client");
             }
         }
     }
 }
 
-/// Читает полный кадр управления (префикс длины + тело).
-async fn read_control_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
+/// Reads one full control frame (length prefix + body).
+async fn read_control_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, ControlReadError> {
     let mut prefix = [0u8; 4];
-    recv.read_exact(&mut prefix)
-        .await
-        .map_err(|err| format!("поток управления закрыт: {err}"))?;
+    recv.read_exact(&mut prefix).await?;
     let len = u32::from_le_bytes(prefix) as usize;
     if len > MAX_CONTROL_MESSAGE_SIZE {
-        return Err(format!("сообщение {len} байт сверх лимита {MAX_CONTROL_MESSAGE_SIZE}"));
+        return Err(ControlReadError::Oversized { len });
     }
     let mut body = vec![0u8; len];
-    recv.read_exact(&mut body)
-        .await
-        .map_err(|err| format!("тело сообщения оборвано: {err}"))?;
+    recv.read_exact(&mut body).await?;
     let mut full = prefix.to_vec();
     full.extend_from_slice(&body);
     Ok(full)
 }
 
-/// Что сервер делает с входящей дейтаграммой клиента.
+/// What the server does with a client's inbound datagram.
 enum PacketAction {
-    /// Loopback-эхо: пакет возвращается клиенту с обменом адресов.
+    /// Loopback echo: the packet returns to the client with addresses swapped.
     Echo(Vec<u8>),
-    /// Боевой режим: пакет уходит в TUN (наружу/локальному сервису ядра).
+    /// Production mode: the packet goes into the TUN (outside / a kernel service).
     Forward(Vec<u8>),
-    /// Пакет адресован другому клиенту: канал его задачи отправки.
+    /// The packet is addressed to another client: its send task channel.
     RouteTo(mpsc::Sender<Vec<u8>>, Vec<u8>),
-    /// Дроп с причиной.
+    /// A drop with a reason.
     Drop(&'static str),
 }
 
-/// Разбирает и классифицирует входящий пакет клиента.
-/// Порядок проверок: валидный IPv4 → анти-спуфинг (`src == vip`) → цель.
+/// Parses and classifies an inbound client packet.
+/// Check order: valid IPv4 → anti-spoofing (`src == vip`) → destination.
 fn process_inbound(shared: &ServerShared, vip: Ipv4Addr, datagram: &[u8]) -> PacketAction {
-    // Кадр должен быть IPv4: IPv6 на роадмапе.
+    // The frame must be IPv4: IPv6 is on the roadmap.
     let datagram = Bytes::copy_from_slice(datagram);
     let Ok(frame) = decode_frame_zero_copy(&datagram) else {
-        return PacketAction::Drop("битый кадр дейтаграммы");
+        return PacketAction::Drop("malformed datagram frame");
     };
     if frame.kind != KIND_IPV4 {
-        return PacketAction::Drop("IPv6-кадр без поддержки");
+        return PacketAction::Drop("IPv6 frames are not supported");
     }
     let packet = frame.payload;
     let Some(header) = ipv4::parse(&packet) else {
-        return PacketAction::Drop("не IPv4-пакет");
+        return PacketAction::Drop("not an IPv4 packet");
     };
 
-    // Анти-спуфинг: клиент обязан отправлять с выданного ему адреса.
+    // Anti-spoofing: the client must send from its assigned address.
     if header.src != vip.octets() {
         tracing::warn!(
             vip = %vip,
             claimed_src = %Ipv4Addr::from(header.src),
-            "спуфинг: пакет с чужим адресом отправителя отброшен"
+            "spoofing: a packet with a foreign source address was dropped"
         );
-        return PacketAction::Drop("спуфинг адреса отправителя");
+        return PacketAction::Drop("source address spoofing");
     }
     shared.metrics.record_bytes_received(u64::from(header.total_len));
 
     let dst = Ipv4Addr::from(header.dst);
     if dst == shared.server_vip {
         if shared.is_loopback() {
-            // Loopback-эхо: адреса меняются местами (src ← server_vip).
+            // Loopback echo: the addresses swap (src ← server_vip).
             let mut reply = packet.to_vec();
             if !ipv4::rewrite_addresses(&mut reply, shared.server_vip.octets(), vip.octets()) {
-                return PacketAction::Drop("пакет не переписывается");
+                return PacketAction::Drop("the packet cannot be rewritten");
             }
             return PacketAction::Echo(reply);
         }
-        // Боевой режим: адрес сервера — локальный сервис ядра через TUN.
+        // Production mode: the server address is a kernel service via the TUN.
         return PacketAction::Forward(packet.to_vec());
     }
-    // Адресован другому клиенту — прямая передача через его канал.
+    // Addressed to another client — direct delivery through its channel.
     if let Some(sender) = shared.routing.route(dst) {
         return PacketAction::RouteTo(sender, packet.to_vec());
     }
     if shared.is_loopback() {
-        PacketAction::Drop("эхо только на адрес сервера")
+        PacketAction::Drop("echo only to the server address")
     } else {
         PacketAction::Forward(packet.to_vec())
     }
@@ -478,25 +485,28 @@ fn process_inbound(shared: &ServerShared, vip: Ipv4Addr, datagram: &[u8]) -> Pac
 mod tests {
     use super::*;
     use crate::config::TokensSource;
-    use std::net::IpAddr;
 
     fn config() -> ServerConfig {
         ServerConfig {
-            listen: "127.0.0.1:0".parse().expect("адрес"),
+            listen: "127.0.0.1:0".parse().expect("address"),
             pool: "10.66.0.0/24".to_owned(),
             mtu: 1280,
             keepalive_interval_secs: 15,
-            dns_servers: vec![IpAddr::from([8, 8, 8, 8])],
+            dns_servers: vec![],
             tun_name: None,
             server_name: "localhost".to_owned(),
             tokens: TokensSource::Inline(vec![("c".to_owned(), "t".to_owned())]),
         }
     }
 
+    fn shared_state() -> Arc<ServerShared> {
+        let cfg = config();
+        ServerShared::new(&cfg, cfg.load_tokens().expect("tokens"), None).expect("server state")
+    }
+
     #[test]
     fn server_shared_wires_pool_and_vip() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
+        let shared = shared_state();
         assert_eq!(shared.server_vip, Ipv4Addr::new(10, 66, 0, 1));
         assert!(shared.is_loopback());
         assert_eq!(shared.active_clients(), 0);
@@ -509,12 +519,12 @@ mod tests {
         let mut cfg = config();
         cfg.pool = "not-a-subnet".to_owned();
         assert!(matches!(
-            ServerShared::new(&cfg, cfg.load_tokens().expect("токены"), None),
+            ServerShared::new(&cfg, cfg.load_tokens().expect("tokens"), None),
             Err(ServerError::Pool(_))
         ));
     }
 
-    /// IPv4-пакет от клиента: src=vip, dst=server_vip (внутренний IP-кадр).
+    /// IPv4 packet from a client: src=vip, dst=server_vip (an inner IP frame).
     fn ipv4_packet(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut pkt = vec![0x45, 0x00, 0x00, 0x00, 0, 1, 0x40, 0x00, 64, 17, 0, 0];
         pkt[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
@@ -524,60 +534,56 @@ mod tests {
         pkt
     }
 
-    /// Дейтаграмма: [kind][IP-пакет].
+    /// Datagram: [kind][IP packet].
     fn datagram(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
         tunnel_proto::frame::encode_frame(KIND_IPV4, &ipv4_packet(src, dst, payload))
     }
 
     #[test]
     fn loopback_echo_swaps_addresses_and_counts_bytes() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
+        let shared = shared_state();
         let vip = Ipv4Addr::new(10, 66, 0, 2);
         let inbound = datagram([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE, 0xAD]);
         match process_inbound(&shared, vip, &inbound) {
             PacketAction::Echo(reply) => {
-                // Echo — чистый IP-пакет (кадрируется в handle_connection).
-                let header = ipv4::parse(&reply).expect("валидный IPv4");
-                assert_eq!(header.src, shared.server_vip.octets(), "src → сервер");
-                assert_eq!(header.dst, [10, 66, 0, 2], "dst → клиент");
-                assert_eq!(&reply[20..], &[0xDE, 0xAD], "payload не тронут");
+                // Echo is a raw IP packet (framed in handle_connection).
+                let header = ipv4::parse(&reply).expect("valid IPv4");
+                assert_eq!(header.src, shared.server_vip.octets(), "src becomes the server");
+                assert_eq!(header.dst, [10, 66, 0, 2], "dst becomes the client");
+                assert_eq!(&reply[20..], &[0xDE, 0xAD], "payload untouched");
             }
-            _ => panic!("loopback обязан эхоить пакет на server_vip"),
+            _ => panic!("loopback must echo packets addressed to server_vip"),
         }
         assert_eq!(shared.metrics.snapshot().bytes_received, 22);
     }
 
     #[test]
     fn spoofed_source_is_dropped() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
-        // Клиент с адресом .2 пытается отправить от имени .3.
+        let shared = shared_state();
+        // A client with address .2 tries to send on behalf of .3.
         let inbound = datagram([10, 66, 0, 3], [10, 66, 0, 1], &[0x01]);
         match process_inbound(&shared, Ipv4Addr::new(10, 66, 0, 2), &inbound) {
             PacketAction::Drop(reason) => {
-                assert_eq!(reason, "спуфинг адреса отправителя");
+                assert_eq!(reason, "source address spoofing");
             }
-            _ => panic!("спуфинг обязан дропаться"),
+            _ => panic!("spoofing must be dropped"),
         }
     }
 
     #[test]
     fn loopback_rejects_packets_to_other_clients() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
-        // dst = адрес, которого нет в таблице (никто не подключён).
+        let shared = shared_state();
+        // dst = an address that is not in the table (nobody is connected).
         let inbound = datagram([10, 66, 0, 2], [10, 66, 0, 9], &[0x01]);
         match process_inbound(&shared, Ipv4Addr::new(10, 66, 0, 2), &inbound) {
-            PacketAction::Drop(reason) => assert_eq!(reason, "эхо только на адрес сервера"),
-            _ => panic!("в loopback без маршрута пакет обязан дропаться"),
+            PacketAction::Drop(reason) => assert_eq!(reason, "echo only to the server address"),
+            _ => panic!("in loopback a packet without a route must be dropped"),
         }
     }
 
     #[tokio::test]
     async fn inter_client_route_bypasses_loopback_restriction() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
+        let shared = shared_state();
         let (tx, mut rx) = mpsc::channel(8);
         shared.routing().register(Ipv4Addr::new(10, 66, 0, 3), tx);
         let inner = ipv4_packet([10, 66, 0, 2], [10, 66, 0, 3], &[0x01]);
@@ -586,45 +592,31 @@ mod tests {
             PacketAction::RouteTo(sender, pkt) => {
                 assert_eq!(
                     pkt, inner,
-                    "клиенту уходит IP-пакет без байта вида кадра"
+                    "the client receives the IP packet without the frame kind byte"
                 );
-                sender.send(pkt).await.expect("канал жив");
+                sender.send(pkt).await.expect("channel alive");
                 assert_eq!(rx.recv().await, Some(inner));
             }
-            _ => panic!("адрес живого клиента маршрутизируется даже в loopback"),
+            _ => panic!("a live client's address is routed even in loopback"),
         }
     }
 
     #[test]
     fn garbage_datagram_is_dropped() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
+        let shared = shared_state();
         assert!(matches!(
             process_inbound(&shared, Ipv4Addr::new(10, 66, 0, 2), &[0xFF, 0x00]),
-            PacketAction::Drop("битый кадр дейтаграммы")
+            PacketAction::Drop("malformed datagram frame")
         ));
     }
 
     #[test]
     fn ipv6_datagram_is_dropped_with_reason() {
-        let shared = ServerShared::new(&config(), config().load_tokens().expect("токены"), None)
-            .expect("состояние сервера");
+        let shared = shared_state();
         let inbound = tunnel_proto::frame::encode_frame(tunnel_proto::frame::KIND_IPV6, &[0x60, 1, 2]);
         match process_inbound(&shared, Ipv4Addr::new(10, 66, 0, 2), &inbound) {
-            PacketAction::Drop(reason) => assert_eq!(reason, "IPv6-кадр без поддержки"),
-            _ => panic!("IPv6 обязан дропаться (роадмап)"),
+            PacketAction::Drop(reason) => assert_eq!(reason, "IPv6 frames are not supported"),
+            _ => panic!("IPv6 must be dropped (roadmap)"),
         }
-    }
-
-    #[test]
-    fn dns_servers_are_carried_for_clients() {
-        // DNS-список хранится в конфиге (роадмап: DHCP-опции); проверяем
-        // проброс через конфигурацию.
-        assert_eq!(config().dns_servers, vec![IpAddr::from([8, 8, 8, 8])]);
-    }
-
-    #[test]
-    fn keepalive_hint_is_carried() {
-        assert_eq!(config().keepalive_interval_secs, 15);
     }
 }
