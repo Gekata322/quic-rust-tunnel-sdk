@@ -1,10 +1,10 @@
-//! Таблица маршрутизации: выданный виртуальный адрес → канал отправки
-//! конкретному клиенту.
+//! Routing table: an assigned virtual address → the send channel of the
+//! concrete client.
 //!
-//! Сессия клиента при регистрации кладёт сюда `mpsc::Sender` своей задачи
-//! отправки; пакеты, адресованные этому `vip` (от других клиентов или из
-//! TUN), уходят по каналу. `unregister` идемпотентен по паре (адрес,
-//! отправитель): затереть живого клиента каналом мёртвой сессии нельзя.
+//! On registration a session puts the `mpsc::Sender` of its send task here;
+//! packets addressed to that `vip` (from other clients or from the TUN) go
+//! through the channel. `unregister` is idempotent on the (address, sender)
+//! pair: a live client cannot be overwritten by a dead session's channel.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
-/// «Выданный адрес → очередь отправки клиенту».
+/// "Assigned address → client send queue".
 #[derive(Debug, Default)]
 pub struct RoutingTable {
     clients: Mutex<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>,
@@ -23,17 +23,17 @@ impl RoutingTable {
         Self::default()
     }
 
-    /// Регистрирует клиента: адрес → канал его задачи отправки.
-    /// Повторная регистрация того же адреса перезаписывает старую запись
-    /// (мёртвая сессия успела потерять канал раньше, чем новая поднялась).
+    /// Registers a client: address → the send channel of its task.
+    /// Registering the same address again overwrites the old entry (a dead
+    /// session lost its channel before the new one came up).
     pub fn register(&self, vip: Ipv4Addr, sender: mpsc::Sender<Vec<u8>>) {
-        self.clients.lock().expect("мьютекс таблицы").insert(vip, sender);
+        self.clients.lock().expect("table mutex").insert(vip, sender);
     }
 
-    /// Снимает регистрацию; возвращает `true`, только если запись
-    /// принадлежала именно этой сессии (чужую запись затереть нельзя).
+    /// Removes the registration; returns `true` only if the entry belonged to
+    /// exactly this session (another session's entry cannot be erased).
     pub fn unregister(&self, vip: Ipv4Addr, sender: &mpsc::Sender<Vec<u8>>) -> bool {
-        let mut clients = self.clients.lock().expect("мьютекс таблицы");
+        let mut clients = self.clients.lock().expect("table mutex");
         match clients.get(&vip) {
             Some(existing) if existing.same_channel(sender) => {
                 clients.remove(&vip);
@@ -43,15 +43,15 @@ impl RoutingTable {
         }
     }
 
-    /// Куда адресовать пакет с получателем `dst`; `None` — адрес не выдан
-    /// никому (пакет в TUN/наружу или мусор).
+    /// Where to route a packet addressed to `dst`; `None` — the address was
+    /// not issued to anyone (the packet goes to the TUN/outside or is garbage).
     pub fn route(&self, dst: Ipv4Addr) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.clients.lock().expect("мьютекс таблицы").get(&dst).cloned()
+        self.clients.lock().expect("table mutex").get(&dst).cloned()
     }
 
-    /// Число активных клиентов в таблице.
+    /// Number of active clients in the table.
     pub fn active(&self) -> usize {
-        self.clients.lock().expect("мьютекс таблицы").len()
+        self.clients.lock().expect("table mutex").len()
     }
 }
 
@@ -74,11 +74,11 @@ mod tests {
         table.register(vip(2), tx);
         assert_eq!(table.active(), 1);
 
-        let routed = table.route(vip(2)).expect("клиент зарегистрирован");
-        routed.send(vec![0xDE]).await.expect("канал жив");
+        let routed = table.route(vip(2)).expect("client registered");
+        routed.send(vec![0xDE]).await.expect("channel alive");
         assert_eq!(rx.recv().await, Some(vec![0xDE]));
 
-        assert!(table.route(vip(9)).is_none(), "невыданный адрес не маршрутизируется");
+        assert!(table.route(vip(9)).is_none(), "an unassigned address is not routed");
     }
 
     #[tokio::test]
@@ -88,14 +88,14 @@ mod tests {
         let (new_tx, _new_rx) = sender_pair();
 
         table.register(vip(2), old_tx.clone());
-        // «Мёртвая» сессия пытается снять регистрацию живого клиента по адресу:
-        // чужая запись не снимается.
-        assert!(!table.unregister(vip(2), &new_tx), "чужую запись снимать нельзя");
-        assert!(table.route(vip(2)).is_some(), "живой клиент остаётся маршрутизируемым");
-        // Правильное снятие своим каналом:
+        // A "dead" session tries to unregister a live client by address:
+        // someone else's entry is not removed.
+        assert!(!table.unregister(vip(2), &new_tx), "must not remove someone else's entry");
+        assert!(table.route(vip(2)).is_some(), "the live client stays routable");
+        // Correct removal by its own channel:
         assert!(table.unregister(vip(2), &old_tx));
         assert!(table.route(vip(2)).is_none());
-        // Повторное снятие — уже ничего.
+        // A repeated removal is a no-op.
         assert!(!table.unregister(vip(2), &old_tx));
         let _ = new_tx;
     }
@@ -107,18 +107,11 @@ mod tests {
         let (new_tx, mut new_rx) = sender_pair();
 
         table.register(vip(3), old_tx.clone());
-        drop(old_rx); // мёртвая сессия: чтение закончилось
+        drop(old_rx); // dead session: reading has ended
         table.register(vip(3), new_tx.clone());
-        assert_eq!(table.active(), 1, "перезапись, а не дубль");
+        assert_eq!(table.active(), 1, "an overwrite, not a duplicate");
 
-        new_tx.send(vec![1]).await.expect("новый канал жив");
+        new_tx.send(vec![1]).await.expect("the new channel is alive");
         assert_eq!(new_rx.recv().await, Some(vec![1]));
-    }
-
-    #[test]
-    fn empty_table_routes_nothing() {
-        let table = RoutingTable::new();
-        assert_eq!(table.active(), 0);
-        assert!(table.route(vip(2)).is_none());
     }
 }

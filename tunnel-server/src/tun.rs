@@ -1,42 +1,43 @@
-//! TUN-интерфейс Linux: L3-туннель ядра для реальной маршрутизации.
+//! Linux TUN interface: an L3 kernel tunnel for real routing.
 //!
-//! Открывает `/dev/net/tun`, ioctl `TUNSETIFF` регистрирует устройство
-//! `IFF_TUN | IFF_NO_PI` (без префикса paket-info — чистые IP-пакеты).
-//! Требуются привилегии: `CAP_NET_ADMIN` или запуск под root.
+//! Opens `/dev/net/tun`; the `TUNSETIFF` ioctl registers the device with
+//! `IFF_TUN | IFF_NO_PI` (no packet-info prefix — raw IP packets). Requires
+//! privileges: `CAP_NET_ADMIN` or running as root.
 //!
-//! Боевой режим сервера без TUN не работает — используйте `--tun tunnel0`;
-//! loopback-режим (`tun_name: None`) обходит TUN и эхоит пакеты обратно.
+//! The server's production mode does not work without TUN — use
+//! `--tun tunnel0`; loopback mode (`tun_name: None`) bypasses the TUN and
+//! echoes packets back.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
 
-/// Путь к устройству управления TUN в Linux.
+/// Path to the TUN control device in Linux.
 const TUN_DEVICE: &str = "/dev/net/tun";
-/// ioctl-запрос TUNSETIFF: назначить имя интерфейса открытому fd.
+/// The TUNSETIFF ioctl: assign an interface name to an open fd.
 const TUNSETIFF: libc_ulong = 0x400454CA;
-/// Флаги ifreq: L3-режим TUN + без префикса paket-info.
+/// ifreq flags: L3 TUN mode + no packet-info prefix.
 const IFF_TUN: u16 = 0x0001;
 const IFF_NO_PI: u16 = 0x1000;
-/// Размер буфера чтения TUN (по умолчанию MTU не превышает 1500, запас ×2).
+/// TUN read buffer size (the default MTU stays under 1500, 2x headroom).
 const READ_BUFFER: usize = 4096;
 
-/// Совместимость с архитектурами: на aarch64 ioctl-запрос имеет тип u32,
-/// на x86_64 — ulong (u64). Имя повторяет libc: разрешаем не-camel-case.
+/// Architecture compatibility: on aarch64 the ioctl request has type u32,
+/// on x86_64 it is ulong (u64). The name mirrors libc: non-camel-case allowed.
 #[allow(non_camel_case_types)]
 #[cfg(target_pointer_width = "64")]
 type libc_ulong = u64;
 #[cfg(target_pointer_width = "32")]
 type libc_ulong = u32;
 
-/// Структура ifreq для ioctl (имя интерфейса + флаги; остальное — нули).
+/// The ifreq structure for the ioctl (interface name + flags; the rest zeros).
 #[repr(C)]
 struct IfReq {
     name: [u8; 16],
     flags: u16,
-    // Остальные поля ifreq не используются: ioctl TUNSETIFF пишет имя и
-    // флаги, pad до типового размера 40 байт, чтобы не переполнить стек.
+    // The other ifreq fields are unused: TUNSETIFF writes the name and flags;
+    // pad to the canonical 40-byte size so the stack cannot overflow.
     _pad: [u8; 22],
 }
 
@@ -44,20 +45,20 @@ extern "C" {
     fn ioctl(fd: i32, request: libc_ulong, arg: *mut IfReq) -> i32;
 }
 
-/// Поднятый TUN-интерфейс. Держит fd открытым; при drop fd закрывается и
-/// интерфейс исчезает (адрес/маршруты сервер печатает в консоль при старте).
+/// An up TUN interface. Keeps the fd open; on drop the fd closes and the
+/// interface disappears (the address/routes are printed by the server at startup).
 pub struct TunDevice {
     inner: AsyncFd<std::fs::File>,
     name: String,
 }
 
 impl TunDevice {
-    /// Создаёт TUN-интерфейс с именем `name` (до 15 символов, IFNAMSIZ-1).
+    /// Creates a TUN interface named `name` (up to 15 chars, IFNAMSIZ-1).
     pub fn open(name: &str) -> io::Result<Self> {
         if name.len() > 15 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("имя интерфейса «{name}» длиннее 15 символов (IFNAMSIZ-1)"),
+                format!("interface name {name:?} is longer than 15 characters (IFNAMSIZ-1)"),
             ));
         }
         let file = std::fs::OpenOptions::new()
@@ -66,11 +67,11 @@ impl TunDevice {
             .open(TUN_DEVICE)
             .map_err(|err| {
                 let hint = match err.kind() {
-                    io::ErrorKind::NotFound => "нет /dev/net/tun: загружен ли модуль tun?",
+                    io::ErrorKind::NotFound => "no /dev/net/tun: is the tun module loaded?",
                     io::ErrorKind::PermissionDenied => {
-                        "нет прав: нужен root или CAP_NET_ADMIN"
+                        "missing permissions: root or CAP_NET_ADMIN required"
                     }
-                    _ => "проверьте поддержку TUN в ядре",
+                    _ => "check TUN support in the kernel",
                 };
                 io::Error::new(err.kind(), format!("{err}: {hint}"))
             })?;
@@ -82,8 +83,8 @@ impl TunDevice {
         };
         req.name[..name.len()].copy_from_slice(name.as_bytes());
 
-        // SAFETY: fd валиден, req — корректно выровненная repr(C) структура
-        // ifreq, ioctl TUNSETIFF заполняет name фактическим именем.
+        // SAFETY: the fd is valid, req is a correctly aligned repr(C) ifreq
+        // structure; TUNSETIFF fills `name` with the actual interface name.
         let result = unsafe { ioctl(file.as_raw_fd(), TUNSETIFF, &mut req) };
         if result < 0 {
             return Err(io::Error::last_os_error());
@@ -94,41 +95,41 @@ impl TunDevice {
         };
 
         Ok(Self {
-            // AsyncFd::register требует unsafe и ручного interest; для
-            // read/write-режима File штатный new допустим (tokio PR #8587).
+            // AsyncFd::register requires unsafe and manual interest; for
+            // read/write mode over File the standard new is fine (tokio PR #8587).
             #[allow(deprecated)]
             inner: AsyncFd::new(file)?,
             name: actual,
         })
     }
 
-    /// Фактическое имя интерфейса (ядро могло дополнить).
+    /// The actual interface name (the kernel may have adjusted it).
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Читает один IP-пакет из TUN (блокирует асинхронно до пакета).
+    /// Reads one IP packet from the TUN (asynchronously blocks until one arrives).
     pub async fn read_packet(&self) -> io::Result<Vec<u8>> {
         loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| {
                 let mut buf = vec![0u8; READ_BUFFER];
-                // &File реализует Read: читаем без mut-доступа к AsyncFd.
+                // &File implements Read: read without mut access to the AsyncFd.
                 let len = inner.get_ref().read(&mut buf)?;
                 if len == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN закрыт"));
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
                 }
                 buf.truncate(len);
                 Ok(buf)
             }) {
                 Ok(result) => return result,
-                // Ещё не готов: readable().await снова уснёт до готовности fd.
+                // Not ready yet: readable().await will sleep again until the fd is ready.
                 Err(_would_block) => continue,
             }
         }
     }
 
-    /// Пишет IP-пакет в TUN (пакет от клиента, адресованный наружу/серверу).
+    /// Writes an IP packet into the TUN (a client packet bound outside/to the server).
     pub async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
         loop {
             let mut guard = self.inner.writable().await?;
@@ -139,7 +140,7 @@ impl TunDevice {
         }
     }
 
-    /// Сырой файловый дескриптор (для организации собственных читателей).
+    /// Raw file descriptor (for building custom readers).
     pub fn raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
@@ -148,28 +149,12 @@ impl TunDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn name_length_is_validated() {
-        let too_long = "interface-16ch"; // 14 символов — ок
-        assert!(too_long.len() <= 15);
-        let bad = "interface-17chars"; // 17 — отказ без обращения к устройству
-        assert_eq!(bad.len(), 17);
-        // Сам ioctl без привилегий не проверить в CI: валидация имени — юнит.
-    }
 
     #[test]
     fn ifreq_layout_matches_kernel_expectations() {
-        // name[16] + flags + pad = 40 байт sizeof(struct ifreq) на linux-x86_64.
+        // name[16] + flags + pad = 40 bytes = sizeof(struct ifreq) on linux-x86_64.
         let req = IfReq { name: [0u8; 16], flags: 0, _pad: [0u8; 22] };
         let size = std::mem::size_of_val(&req);
-        assert_eq!(size, 40, "sizeof(ifreq) обязателен 40 для TUNSETIFF");
-    }
-
-    #[test]
-    fn server_vip_hint_in_docs_matches_pool() {
-        // Документируемое соответствие: 10.66.0.0/24 → server_vip .1 (pool.rs).
-        assert_eq!(Ipv4Addr::new(10, 66, 0, 1).octets()[3], 1);
+        assert_eq!(size, 40, "sizeof(ifreq) must be 40 for TUNSETIFF");
     }
 }

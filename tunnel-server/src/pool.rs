@@ -1,45 +1,45 @@
-//! Пул виртуальных IP: выдача адресов клиентам и переиспользование после
-//! отсоединения.
+//! Virtual IP pool: assigning addresses to clients and reuse after
+//! disconnection.
 //!
-//! Из подсети (например `10.66.0.0/24`) первый адрес (`.1`) закреплён за
-//! сервером (`server_vip`), клиентам выдаются адреса со второго (`.2`).
-//! Адреса выдаются последовательно; освободившийся адрес становится
-//! кандидатом на переиспользование — длинные сессии не растрачивают пул.
+//! In the subnet (e.g. `10.66.0.0/24`) the first address (`.1`) is reserved
+//! for the server (`server_vip`); clients get addresses starting from the
+//! second one (`.2`). Addresses are issued sequentially; a freed address
+//! becomes a reuse candidate — long sessions do not exhaust the pool.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
-/// Ошибки работы с пулом адресов.
+/// Address pool errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PoolError {
-    /// Подсеть не распарсилась или маска не байтовая (/24..../32).
-    #[error("подсеть «{0}» не поддерживается: нужен CIDR с байтовой маской, например 10.66.0.0/24")]
+    /// The subnet did not parse or the mask is not byte-aligned (/24..../32).
+    #[error("subnet {0:?} is not supported: a CIDR with a byte-aligned mask is required, e.g. 10.66.0.0/24")]
     BadSubnet(String),
-    /// Адрес не принадлежит подсети пула.
-    #[error("адрес {0} вне подсети пула")]
+    /// The address does not belong to the pool subnet.
+    #[error("address {0} is outside the pool subnet")]
     ForeignAddress(Ipv4Addr),
 }
 
-/// Последовательный пул адресов одной подсети /24.../32.
+/// Sequential address pool of a single /24.../32 subnet.
 #[derive(Debug)]
 pub struct IpPool {
-    /// Сетевые октеты подсети (для /24 — первые три).
+    /// Network octets of the subnet (the first three for /24).
     prefix: [u8; 3],
-    /// Границы клиентских хост-октетов: 2..=last_client_host
-    /// (сеть .0 не выдаётся, broadcast не выдаётся, .1 — сервер).
+    /// Client host-octet bounds: 2..=last_client_host
+    /// (the network .0 is not issued, neither is the broadcast, .1 is the server).
     first_client_host: u8,
     last_client_host: u8,
-    /// Серверный адрес — первый адрес подсети, никогда не выдаётся клиентам.
+    /// Server address — the first address of the subnet, never issued to clients.
     server_vip: Ipv4Addr,
-    /// Занятые клиентские октеты (последний октет).
+    /// Taken client host octets (the last octet).
     taken: Mutex<BTreeSet<u8>>,
-    /// Курсор выдачи: растёт до последнего клиента, потом переиспользует свободные.
+    /// Issuing cursor: grows to the last client, then reuses freed addresses.
     cursor: Mutex<u8>,
 }
 
 impl IpPool {
-    /// Разбирает подсеть вида `10.66.0.0/24` (маска кратна байту).
+    /// Parses a subnet like `10.66.0.0/24` (mask is a multiple of a byte).
     pub fn from_subnet(subnet: &str) -> Result<Self, PoolError> {
         let (addr, mask) = subnet
             .trim()
@@ -60,18 +60,18 @@ impl IpPool {
             return Err(PoolError::BadSubnet(subnet.to_owned()));
         }
         let prefix = [octets[0], octets[1], octets[2]];
-        // Размер блока хостов: 256 для /24, 4 для /30, 1 для /32.
+        // Host block size: 256 for /24, 4 for /30, 1 for /32.
         let block = 1u32 << (32 - u32::from(mask_bits));
-        // Серверный адрес — первый usable-хост подсети (.1 для /24, /30, ...).
+        // The server address is the first usable host of the subnet (.1 for /24, /30, ...).
         let server_host: u8 = if block >= 2 { 1 } else { 0 };
         let server_vip = Ipv4Addr::new(prefix[0], prefix[1], prefix[2], server_host);
-        // Клиентские адреса: от .2 (после сервера) до broadcast-1 (для /24 — .254).
-        // Для /31 и /32 last_client_host=0 < first=2 → ёмкость нулевая.
+        // Client addresses: from .2 (after the server) to broadcast-1 (.254 for /24).
+        // For /31 and /32 last_client_host=0 < first=2 → zero capacity.
         let first_client_host: u8 = 2;
         let last_client_host: u8 = if block >= 4 {
-            (block - 2) as u8 // 256-2 = 254 для /24; 4-2 = 2 для /30
+            (block - 2) as u8 // 256-2 = 254 for /24; 4-2 = 2 for /30
         } else {
-            0 // /31, /32: клиентских адресов нет
+            0 // /31, /32: no client addresses
         };
         Ok(Self {
             prefix,
@@ -83,12 +83,12 @@ impl IpPool {
         })
     }
 
-    /// Адрес сервера в этой подсети (первый адрес).
+    /// The server address in this subnet (the first one).
     pub fn server_vip(&self) -> Ipv4Addr {
         self.server_vip
     }
 
-    /// Ёмкость пула для клиентов: usable-адреса минус сеть, broadcast и сервер.
+    /// Pool capacity for clients: usable addresses minus network, broadcast and server.
     pub fn capacity(&self) -> usize {
         if self.last_client_host < self.first_client_host {
             return 0;
@@ -96,12 +96,12 @@ impl IpPool {
         usize::from(self.last_client_host - self.first_client_host + 1)
     }
 
-    /// Выдаёт следующий свободный адрес. `None` — пул исчерпан
-    /// (сервер отвечает `Reject{ServerBusy}`).
+    /// Issues the next free address. `None` — the pool is exhausted
+    /// (the server answers `Reject{ServerBusy}`).
     pub fn alloc(&self) -> Option<Ipv4Addr> {
-        let mut taken = self.taken.lock().expect("мьютекс пула");
-        let mut cursor = self.cursor.lock().expect("мьютекс курсора");
-        // Прямой ход: cursor идёт по клиентским хост-октетам (для /24 — с .2).
+        let mut taken = self.taken.lock().expect("pool mutex");
+        let mut cursor = self.cursor.lock().expect("cursor mutex");
+        // Forward pass: the cursor walks the client host octets (from .2 for /24).
         while *cursor < self.last_client_host {
             *cursor += 1;
             let host = *cursor;
@@ -110,7 +110,7 @@ impl IpPool {
                 return Some(self.address(host));
             }
         }
-        // Курсор исчерпан: ищем освобождённые с начала.
+        // The cursor is exhausted: scan for freed addresses from the start.
         for host in self.first_client_host..=self.last_client_host {
             if !taken.contains(&host) {
                 taken.insert(host);
@@ -121,7 +121,7 @@ impl IpPool {
         None
     }
 
-    /// Возвращает адрес в пул после отсоединения клиента.
+    /// Returns an address to the pool after a client disconnects.
     pub fn release(&self, ip: Ipv4Addr) -> Result<bool, PoolError> {
         if ip.octets()[0..3] != self.prefix {
             return Err(PoolError::ForeignAddress(ip));
@@ -133,15 +133,15 @@ impl IpPool {
         {
             return Err(PoolError::ForeignAddress(ip));
         }
-        Ok(self.taken.lock().expect("мьютекс пула").remove(&host))
+        Ok(self.taken.lock().expect("pool mutex").remove(&host))
     }
 
-    /// Число выданных адресов (для метрик и диагностики).
+    /// Number of issued addresses (for metrics and diagnostics).
     pub fn allocated(&self) -> usize {
-        self.taken.lock().expect("мьютекс пула").len()
+        self.taken.lock().expect("pool mutex").len()
     }
 
-    /// Собирает полный адрес из префикса и хост-октета.
+    /// Builds the full address from the prefix and the host octet.
     fn address(&self, host: u8) -> Ipv4Addr {
         Ipv4Addr::new(self.prefix[0], self.prefix[1], self.prefix[2], host)
     }
@@ -153,15 +153,15 @@ mod tests {
 
     #[test]
     fn server_vip_is_first_address() {
-        let pool = IpPool::from_subnet("10.66.0.0/24").expect("подсеть");
+        let pool = IpPool::from_subnet("10.66.0.0/24").expect("subnet");
         assert_eq!(pool.server_vip(), Ipv4Addr::new(10, 66, 0, 1));
-        assert_eq!(pool.capacity(), 253, "256 - сеть - broadcast - сервер");
+        assert_eq!(pool.capacity(), 253, "256 - network - broadcast - server");
     }
 
     #[test]
     fn sequential_alloc_starts_from_second_host() {
-        let pool = IpPool::from_subnet("10.66.0.0/24").expect("подсеть");
-        assert_eq!(pool.alloc().map(|ip| ip.octets()[3]), Some(2), "первый клиент — .2");
+        let pool = IpPool::from_subnet("10.66.0.0/24").expect("subnet");
+        assert_eq!(pool.alloc().map(|ip| ip.octets()[3]), Some(2), "the first client gets .2");
         assert_eq!(pool.alloc().map(|ip| ip.octets()[3]), Some(3));
         assert_eq!(pool.alloc().map(|ip| ip.octets()[3]), Some(4));
         assert_eq!(pool.allocated(), 3);
@@ -169,46 +169,46 @@ mod tests {
 
     #[test]
     fn alloc_covers_full_range_and_stops() {
-        let pool = IpPool::from_subnet("10.66.0.0/30").expect("подсеть");
-        let only = pool.alloc().expect("единственный адрес .2");
+        let pool = IpPool::from_subnet("10.66.0.0/30").expect("subnet");
+        let only = pool.alloc().expect("the single address .2");
         assert_eq!(only, std::net::Ipv4Addr::new(10, 66, 0, 2));
         assert!(pool.alloc().is_none());
-        // Повторный alloc после release снова выдаёт .2.
-        pool.release(only).expect("возврат в пул");
+        // A repeated alloc after release issues .2 again.
+        pool.release(only).expect("returned to the pool");
         assert_eq!(pool.alloc(), Some(only));
     }
 
     #[test]
     fn released_address_is_reused() {
-        // Исчерпываем маленький пул (/29: 6 клиентских адресов .2..6), затем
-        // освобождаем середину — переиспользование находит её вторым проходом.
-        let pool = IpPool::from_subnet("10.66.0.0/29").expect("подсеть");
+        // Exhaust a small pool (/29: 5 client addresses .2..6), then free the
+        // middle one — reuse finds it on the second pass.
+        let pool = IpPool::from_subnet("10.66.0.0/29").expect("subnet");
         assert_eq!(pool.capacity(), 5);
         let mut issued = Vec::new();
         for _ in 0..5 {
-            issued.push(pool.alloc().expect("адрес"));
+            issued.push(pool.alloc().expect("address"));
         }
-        assert!(pool.alloc().is_none(), "курсор исчерпан");
+        assert!(pool.alloc().is_none(), "the cursor is exhausted");
         let freed = issued[2]; // .4
-        assert!(pool.release(freed).expect("адрес из подсети"));
+        assert!(pool.release(freed).expect("address from the subnet"));
         assert_eq!(pool.allocated(), 4);
-        let reused = pool.alloc().expect("переиспользованный адрес");
-        assert_eq!(reused, freed, "освободившийся адрес выдаётся снова");
+        let reused = pool.alloc().expect("reused address");
+        assert_eq!(reused, freed, "the freed address is issued again");
     }
 
     #[test]
     fn release_rejects_foreign_addresses() {
-        let pool = IpPool::from_subnet("10.66.0.0/24").expect("подсеть");
+        let pool = IpPool::from_subnet("10.66.0.0/24").expect("subnet");
         assert!(matches!(
             pool.release(Ipv4Addr::new(192, 168, 0, 2)),
             Err(PoolError::ForeignAddress(_))
         ));
-        // Серверный адрес не возвращается в пул клиентов.
+        // The server address is never returned to the client pool.
         assert!(matches!(
             pool.release(Ipv4Addr::new(10, 66, 0, 1)),
             Err(PoolError::ForeignAddress(_))
         ));
-        // Свои, но свободные адреса возвращают Ok(false), а не ошибку.
+        // Own but free addresses return Ok(false), not an error.
         assert_eq!(pool.release(Ipv4Addr::new(10, 66, 0, 99)), Ok(false));
     }
 
@@ -218,26 +218,26 @@ mod tests {
         assert!(matches!(IpPool::from_subnet("10.66.0.0/23"), Err(PoolError::BadSubnet(_))));
         assert!(matches!(IpPool::from_subnet("10.66.0/24"), Err(PoolError::BadSubnet(_))));
         assert!(matches!(IpPool::from_subnet("10.66.0.0/33"), Err(PoolError::BadSubnet(_))));
-        // Маски 24..32 — любые: /28 даёт 13 клиентских адресов.
-        let narrow = IpPool::from_subnet("10.66.0.0/28").expect("подсеть");
+        // Masks 24..32 are all valid: /28 gives 13 client addresses.
+        let narrow = IpPool::from_subnet("10.66.0.0/28").expect("subnet");
         assert_eq!(narrow.capacity(), 13);
-        assert!(IpPool::from_subnet("10.66.0.0/32").is_ok(), "/32: только сервер, 0 клиентов");
+        assert!(IpPool::from_subnet("10.66.0.0/32").is_ok(), "/32: server only, 0 clients");
     }
 
     #[test]
     fn capacity_zero_for_slash_32() {
-        let pool = IpPool::from_subnet("10.66.0.0/32").expect("подсеть");
+        let pool = IpPool::from_subnet("10.66.0.0/32").expect("subnet");
         assert_eq!(pool.capacity(), 0);
-        assert!(pool.alloc().is_none(), "нет адресов для клиентов");
+        assert!(pool.alloc().is_none(), "no addresses for clients");
     }
 
     #[test]
     fn full_pool_returns_none() {
-        let pool = IpPool::from_subnet("10.66.0.0/30").expect("подсеть");
-        // /30: 4 адреса = сеть + 2 хоста + broadcast; сервер занимает .1 → 1 клиент.
+        let pool = IpPool::from_subnet("10.66.0.0/30").expect("subnet");
+        // /30: 4 addresses = network + 2 hosts + broadcast; the server takes .1 → 1 client.
         assert_eq!(pool.capacity(), 1);
-        let only = pool.alloc().expect("единственный клиентский адрес");
+        let only = pool.alloc().expect("the only client address");
         assert_eq!(only.octets()[3], 2);
-        assert!(pool.alloc().is_none(), "пул исчерпан");
+        assert!(pool.alloc().is_none(), "the pool is exhausted");
     }
 }
