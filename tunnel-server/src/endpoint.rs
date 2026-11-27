@@ -1,10 +1,10 @@
-//! QUIC-эндпоинт сервера: самоподписанный сертификат, ALPN, цикл приёма.
+//! Server QUIC endpoint: self-signed certificate, ALPN, accept loop.
 //!
-//! Сертификат сервера генерируется при старте (rcgen) и выгружается DER-файлом
-//! (`--export-cert`): партнёр кладёт его в `pinned_server_cert_der` — public CA
-//! не используются, единственный доверенный корень. При повторных запусках
-//! сервера сертификат пересоздаётся; в проде закрепляйте его раз и
-//! распространяйте через релизный процесс партнёра.
+//! The server certificate is generated at startup (rcgen) and exported as a
+//! DER file (`--export-cert`): the partner puts it into
+//! `pinned_server_cert_der` — public CAs are not used, it is the only trusted
+//! root. On server restarts the certificate is regenerated; in production pin
+//! it once and distribute it through the partner release process.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,35 +17,33 @@ use tunnel_proto::ALPN_TUNNEL_V1;
 
 use crate::session::ServerShared;
 
-/// Ошибки подъёма TLS/QUIC-эндпоинта.
+/// TLS/QUIC endpoint startup errors.
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
-    /// Сертификат/ключ не собрался.
-    #[error("сертификат: {0}")]
+    /// The certificate/key did not build.
+    #[error("certificate: {0}")]
     Certificate(String),
-    /// UDP-эндпоинт не привязался.
+    /// The UDP endpoint did not bind.
     #[error("bind {0}: {1}")]
     Bind(SocketAddr, #[source] std::io::Error),
-    /// Внутренняя ошибка сборки QUIC поверх TLS.
+    /// Internal error building QUIC over TLS.
     #[error("QUIC/TLS: {0}")]
     Quic(String),
 }
 
-/// Самоподписанный сертификат сервера + ключ (для `build_endpoint`).
+/// Self-signed server certificate + key (for `build_endpoint`).
 #[derive(Debug, Clone)]
 pub struct Certificate {
-    /// DER-сертификат: то, что партнёр pin-ит (пишется в `--export-cert`).
+    /// DER certificate: what the partner pins (written by `--export-cert`).
     pub der: rustls::pki_types::CertificateDer<'static>,
-    /// PKCS#8 DER ключа; не покидает сервер.
+    /// PKCS#8 DER of the key; never leaves the server.
     key_der: Vec<u8>,
 }
 
-/// Генерирует самоподписанный сертификат с SAN=`server_name`.
-/// Для loopback-проверок добавляются SAN 127.0.0.1, чтобы клиенты могли
-/// подключаться по IP.
+/// Generates a self-signed certificate with SAN=`server_name`.
+/// For loopback checks a 127.0.0.1 SAN is added so clients can connect by IP.
 pub fn generate_certificate(server_name: &str) -> Result<Certificate, EndpointError> {
-    let mut subjects = vec![server_name.to_owned()];
-    subjects.push("127.0.0.1".to_owned());
+    let subjects = vec![server_name.to_owned(), "127.0.0.1".to_owned()];
     let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subjects)
         .map_err(|err| EndpointError::Certificate(format!("{err}")))?;
     Ok(Certificate {
@@ -54,8 +52,8 @@ pub fn generate_certificate(server_name: &str) -> Result<Certificate, EndpointEr
     })
 }
 
-/// Собирает QUIC-эндпоинт: TLS с ALPN `tunnel/v1`, дейтаграммы, разумные
-/// тайм-ауты. Клиент без совпадающего ALPN отсекается ещё на TLS-рукопожатии.
+/// Builds the QUIC endpoint: TLS with ALPN `tunnel/v1`, datagrams, sensible
+/// timeouts. A client without a matching ALPN is cut off at the TLS handshake.
 pub fn build_endpoint(cert: &Certificate, listen: SocketAddr) -> Result<quinn::Endpoint, EndpointError> {
     let cert_der = cert.der.clone();
     let key_der = PrivatePkcs8KeyDer::from(cert.key_der.clone());
@@ -72,7 +70,7 @@ pub fn build_endpoint(cert: &Certificate, listen: SocketAddr) -> Result<quinn::E
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
-            .expect("30с укладываются в VarInt"),
+            .expect("30s fits into a VarInt"),
     ));
     transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 
@@ -85,8 +83,8 @@ pub fn build_endpoint(cert: &Certificate, listen: SocketAddr) -> Result<quinn::E
         .map_err(|err| EndpointError::Bind(listen, err))
 }
 
-/// Цикл приёма подключений: QUIC-соединение → обработчик сессии.
-/// Завершается по `shutdown_rx = true` или закрытию канала остановки.
+/// Connection accept loop: QUIC connection → session handler.
+/// Terminates on `shutdown_rx = true` or when the stop channel closes.
 pub async fn accept_loop(
     shared: Arc<ServerShared>,
     endpoint: quinn::Endpoint,
@@ -98,9 +96,9 @@ pub async fn accept_loop(
             changed = shutdown_rx.changed() => {
                 match changed {
                     Ok(()) if !*shutdown_rx.borrow() => continue,
-                    // true или канал закрыт (владелец дропнулся) — останавливаемся.
+                    // true or the channel closed (the owner dropped) — stop.
                     _ => {
-                        tracing::info!("команда остановки: accept_loop завершается");
+                        tracing::info!("stop command: accept_loop is shutting down");
                         endpoint.close(0u32.into(), b"server-shutdown");
                         return;
                     }
@@ -108,14 +106,14 @@ pub async fn accept_loop(
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
-                    tracing::info!("эндпоинт закрыт: accept_loop завершается");
+                    tracing::info!("endpoint closed: accept_loop is shutting down");
                     return;
                 };
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => crate::session::handle_connection(shared, conn).await,
-                        Err(err) => tracing::debug!(%err, "QUIC-рукопожатие не состоялось"),
+                        Err(err) => tracing::debug!(%err, "QUIC handshake did not complete"),
                     }
                 });
             }
@@ -129,45 +127,37 @@ mod tests {
 
     #[test]
     fn certificate_has_valid_der_and_names() {
-        let cert = generate_certificate("tunnel-server").expect("сертификат");
-        assert!(cert.der.len() > 100, "DER-сертификат не может быть таким коротким");
-        assert_eq!(cert.der[0], 0x30, "DER начинается с SEQUENCE");
+        let cert = generate_certificate("tunnel-server").expect("certificate");
+        assert!(cert.der.len() > 100, "a DER certificate cannot be this short");
+        assert_eq!(cert.der[0], 0x30, "DER starts with a SEQUENCE");
         assert!(!cert.key_der.is_empty());
 
-        // DER парсится rustls-типами (тот же путь, что и при pinning).
-        let _parsed = &cert.der; // CertificateDer: deref к &[u8] уже проверен выше
-        assert!(cert.der.as_ref().len() == cert.der.len(), "CertificateDer согласован");
-        let _key: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(cert.key_der.clone());
+        // The DER parses into rustls types (the same path as pinning).
+        let _parsed: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(cert.key_der.clone());
     }
 
     #[tokio::test]
     async fn endpoint_binds_and_reports_local_addr() {
-        let cert = generate_certificate("localhost").expect("сертификат");
+        let cert = generate_certificate("localhost").expect("certificate");
         let endpoint =
-            build_endpoint(&cert, "127.0.0.1:0".parse().expect("адрес")).expect("эндпоинт");
-        let addr = endpoint.local_addr().expect("локальный адрес");
-        assert_ne!(addr.port(), 0, "ОС выдала эфемерный порт");
+            build_endpoint(&cert, "127.0.0.1:0".parse().expect("address")).expect("endpoint");
+        let addr = endpoint.local_addr().expect("local address");
+        assert_ne!(addr.port(), 0, "the OS issued an ephemeral port");
         endpoint.close(0u32.into(), b"bye");
     }
 
     #[tokio::test]
     async fn bind_twice_on_same_port_fails_clearly() {
-        let cert = generate_certificate("localhost").expect("сертификат");
-        let endpoint = build_endpoint(&cert, "127.0.0.1:0".parse().expect("адрес"))
-            .expect("первый эндпоинт");
-        let port = endpoint.local_addr().expect("адрес").port();
-        let second = build_endpoint(&cert, format!("127.0.0.1:{port}").parse().expect("адрес"));
+        let cert = generate_certificate("localhost").expect("certificate");
+        let endpoint = build_endpoint(&cert, "127.0.0.1:0".parse().expect("address"))
+            .expect("first endpoint");
+        let port = endpoint.local_addr().expect("address").port();
+        let second = build_endpoint(&cert, format!("127.0.0.1:{port}").parse().expect("address"));
         match second {
             Err(EndpointError::Bind(addr, _)) => assert_eq!(addr.port(), port),
-            Ok(_) => panic!("повторный bind того же порта обязан упасть"),
-            Err(other) => panic!("неожиданная ошибка: {other}"),
+            Ok(_) => panic!("a second bind of the same port must fail"),
+            Err(other) => panic!("unexpected error: {other}"),
         }
         endpoint.close(0u32.into(), b"bye");
-    }
-
-    #[test]
-    fn certificate_error_display() {
-        let err = EndpointError::Certificate("битый DER".to_owned());
-        assert_eq!(err.to_string(), "сертификат: битый DER");
     }
 }

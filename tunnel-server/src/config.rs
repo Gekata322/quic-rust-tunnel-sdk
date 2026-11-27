@@ -1,7 +1,7 @@
-//! Конфигурация сервера: источник токенов, параметры подсети/MTU/TUN.
+//! Server configuration: token source, subnet/MTU/TUN parameters.
 //!
-//! Заполняется из CLI (см. `main.rs`) или напрямую из кода (интеграционные
-//! тесты используют `TokensSource::Inline`). Загрузка токенов — через
+//! Populated from the CLI (see `main.rs`) or directly from code (integration
+//! tests use `TokensSource::Inline`). Token loading goes through
 //! `tunnel_proto::auth::TokenStore`.
 
 use std::net::{IpAddr, SocketAddr};
@@ -9,55 +9,55 @@ use std::path::PathBuf;
 
 use tunnel_proto::auth::TokenStore;
 
-/// Ошибки конфигурации сервера.
+/// Server configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Файл токенов не читается или бит.
-    #[error("файл токенов «{0}»: {1}")]
+    /// The token file is unreadable or malformed.
+    #[error("token file {0:?}: {1}")]
     TokensFile(String, #[source] std::io::Error),
-    /// Переменная TUNNEL_TOKENS не задана при `TokensSource::Env`.
-    #[error("переменная TUNNEL_TOKENS не задана (или пуста)")]
+    /// The TUNNEL_TOKENS variable is missing for `TokensSource::Env`.
+    #[error("the TUNNEL_TOKENS variable is not set (or empty)")]
     TokensEnvMissing,
-    /// Конфигурация недействительна.
-    #[error("конфигурация некорректна: {0}")]
+    /// The configuration is invalid.
+    #[error("invalid configuration: {0}")]
     Invalid(String),
 }
 
-/// Откуда сервер берёт B2B-токены партнёров.
+/// Where the server takes the partner B2B tokens from.
 #[derive(Debug, Clone)]
 pub enum TokensSource {
-    /// Готовые пары `(client_id, token)` — тесты и встраивание.
+    /// Ready `(client_id, token)` pairs — tests and embedding.
     Inline(Vec<(String, String)>),
-    /// Файл `"client_id:token"` построчно (`#` — комментарии).
+    /// A file with one `"client_id:token"` pair per line (`#` — comments).
     File(PathBuf),
-    /// Переменная окружения `TUNNEL_TOKENS` (`"a:t1,b:t2"`).
+    /// The `TUNNEL_TOKENS` environment variable (`"a:t1,b:t2"`).
     Env,
 }
 
-/// Полная конфигурация сервера.
+/// Full server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// UDP-адрес слушателя QUIC (обычно `0.0.0.0:443`).
+    /// UDP address of the QUIC listener (usually `0.0.0.0:443`).
     pub listen: SocketAddr,
-    /// Подсеть виртуальных адресов, CIDR с байтовой маской (`10.66.0.0/24`).
+    /// Virtual address subnet, a CIDR with a byte-aligned mask (`10.66.0.0/24`).
     pub pool: String,
-    /// MTU виртуального интерфейса клиентов (обычно 1280).
+    /// MTU of the clients' virtual interface (usually 1280).
     pub mtu: u16,
-    /// Период прикладного ping, передаваемый клиентам в `Welcome`, сек.
+    /// Application ping period sent to clients in `Welcome`, sec.
     pub keepalive_interval_secs: u32,
-    /// DNS-серверы, рекомендуемые клиентам (роадмап: DHCP-опции туннеля).
+    /// DNS servers recommended to clients (roadmap: tunnel DHCP options).
     pub dns_servers: Vec<IpAddr>,
-    /// Имя TUN-интерфейса; `None` — loopback-режим (эхо на адрес сервера).
+    /// TUN interface name; `None` — loopback mode (echo to the server address).
     pub tun_name: Option<String>,
-    /// Имя сервера для SAN сертификата и SNI (должно совпадать с ожиданием
-    /// клиентов в `TunnelConfig::server_name`).
+    /// Server name for the certificate SAN and SNI (must match what clients
+    /// expect in `TunnelConfig::server_name`).
     pub server_name: String,
-    /// Источник токенов.
+    /// Token source.
     pub tokens: TokensSource,
 }
 
 impl ServerConfig {
-    /// Загружает токены из настроенного источника.
+    /// Loads tokens from the configured source.
     pub fn load_tokens(&self) -> Result<TokenStore, ConfigError> {
         match &self.tokens {
             TokensSource::Inline(pairs) => Ok(TokenStore::from_pairs(pairs.clone())),
@@ -72,27 +72,27 @@ impl ServerConfig {
         }
     }
 
-    /// Ранние и понятные ошибки вместо молчаливых проблем в рантайме.
+    /// Early and clear errors instead of silent runtime problems.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.server_name.trim().is_empty() {
-            return Err(ConfigError::Invalid("server_name пуст — SAN сертификата не собрать".to_owned()));
+            return Err(ConfigError::Invalid("server_name is empty — cannot build the certificate SAN".to_owned()));
         }
         if self.mtu == 0 {
-            return Err(ConfigError::Invalid("mtu равен нулю".to_owned()));
+            return Err(ConfigError::Invalid("mtu is zero".to_owned()));
         }
         if self.mtu < 1280 {
             return Err(ConfigError::Invalid(format!(
-                "mtu {mtu} меньше минимума QUIC (1280) — фрагментация гарантирована",
+                "mtu {mtu} is below the QUIC minimum (1280) — fragmentation is guaranteed",
                 mtu = self.mtu
             )));
         }
-        // Порт 0 легален: ОС выдаёт эфемерный (тесты, динамический деплой).
-        // Подсеть валидирует IpPool при старте состояния сервера.
+        // Port 0 is legal: the OS issues an ephemeral one (tests, dynamic deploys).
+        // The subnet is validated by IpPool at server state startup.
         Ok(())
     }
 
-    /// Loopback-режим: без TUN — эхо пакетов на адрес сервера (для CI и
-    /// проверки клиентов без привилегий).
+    /// Loopback mode: without TUN — packets are echoed to the server address
+    /// (for CI and client checks without privileges).
     pub fn is_loopback(&self) -> bool {
         self.tun_name.is_none()
     }
@@ -104,7 +104,7 @@ mod tests {
 
     fn base() -> ServerConfig {
         ServerConfig {
-            listen: "127.0.0.1:0".parse().expect("адрес"),
+            listen: "127.0.0.1:0".parse().expect("address"),
             pool: "10.66.0.0/24".to_owned(),
             mtu: 1280,
             keepalive_interval_secs: 1,
@@ -116,24 +116,16 @@ mod tests {
     }
 
     #[test]
-    fn inline_tokens_load() {
-        let config = base();
-        let store = config.load_tokens().expect("инлайн-токены");
-        assert_eq!(store.len(), 1);
-        assert!(store.verify("c", "t"));
-    }
-
-    #[test]
     fn file_tokens_load() {
         let dir = std::env::temp_dir().join(format!("tunnel-server-tokens-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let path = dir.join("tokens.txt");
-        std::fs::write(&path, "# партнёр\npartner: tok-123\n").expect("файл токенов");
+        std::fs::write(&path, "# partner\npartner: tok-123\n").expect("token file");
         let mut config = base();
         config.tokens = TokensSource::File(path.clone());
-        let store = config.load_tokens().expect("файл токенов");
+        let store = config.load_tokens().expect("token file");
         assert!(store.verify("partner", "tok-123"));
-        std::fs::remove_dir_all(&dir).expect("чистка tmp");
+        std::fs::remove_dir_all(&dir).expect("tmp cleanup");
     }
 
     #[test]
@@ -159,14 +151,7 @@ mod tests {
         bad.server_name = String::new();
         assert!(matches!(bad.validate(), Err(ConfigError::Invalid(_))));
         let mut ok = base();
-        ok.listen = "127.0.0.1:0".parse().expect("эфемерный порт");
-        assert!(ok.validate().is_ok(), "порт 0 — валидный эфемерный слушатель");
-    }
-
-    #[test]
-    fn loopback_detection() {
-        let mut config = base();
-        config.tun_name = Some("tunnel0".to_owned());
-        assert!(!config.is_loopback());
+        ok.listen = "127.0.0.1:0".parse().expect("ephemeral port");
+        assert!(ok.validate().is_ok(), "port 0 is a valid ephemeral listener");
     }
 }

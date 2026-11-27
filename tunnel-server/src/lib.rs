@@ -1,15 +1,15 @@
-//! Сервер B2B-туннеля: авторизация партнёров, выдача виртуальных адресов,
-//! маршрутизация пакетов между клиентами и наружу, loopback-режим для CI.
+//! B2B tunnel server: partner authorization, virtual address assignment,
+//! packet routing between clients and to the outside, loopback mode for CI.
 //!
-//! Слои:
-//! - [`config`] — конфигурация из CLI/файла/env, загрузка токенов;
-//! - [`endpoint`] — TLS/QUIC-эндпоинт (самоподписанный сертификат, ALPN),
-//!   цикл приёма подключений;
-//! - [`session`] — состояние сервера и обработка сессий: рукопожатие
-//!   `Hello → Welcome/Reject`, control plane (ping/pong), data plane
-//!   (дейтаграммы ⇄ [`routing`]/[`tun`]);
-//! - [`pool`] — пул виртуальных IP с переиспользованием адресов;
-//! - [`routing`] — таблица «выданный адрес → клиент».
+//! Layers:
+//! - [`config`] — configuration from CLI/file/env, token loading;
+//! - [`endpoint`] — the TLS/QUIC endpoint (self-signed certificate, ALPN)
+//!   and the accept loop;
+//! - [`session`] — server state and session handling: the `Hello →
+//!   Welcome/Reject` handshake, the control plane (ping/pong), the data plane
+//!   (datagrams ⇄ [`routing`]/[`tun`]);
+//! - [`pool`] — the virtual IP pool with address reuse;
+//! - [`routing`] — the "assigned address → client" table.
 
 pub mod config;
 pub mod endpoint;
