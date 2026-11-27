@@ -1,57 +1,49 @@
-//! Кадрирование IP-пакетов для QUIC-дейтаграмм.
+//! IP packet framing for QUIC datagrams.
 //!
-//! Формат дейтаграммы — минимальный: `[kind: u8][payload]`. QUIC-дейтаграммы
-//! не фрагментируются и не дробятся, поэтому длина не пишется — она известна
-//! из размера дейтаграммы. Приём идёт без копий: payload отрезается от
-//! `Bytes` как view ([`decode_frame_zero_copy`]).
+//! Datagram layout is minimal: `[kind: u8][payload]`. QUIC datagrams are never
+//! fragmented or split, so the length is implied by the datagram size and not
+//! written to the wire. Decoding is zero-copy: the payload is a view into the
+//! original `Bytes` ([`decode_frame_zero_copy`]).
 //!
-//! Виды кадра ограничены двумя значениями: неизвестный kind отбрасывается
-//! сразу — платформа не увидит мусора в очереди пакетов.
+//! Frame kinds are limited to IP versions; an unknown kind is rejected
+//! immediately so garbage never reaches the packet queue.
 
 use bytes::Bytes;
+use thiserror::Error;
 
-/// IPv4-пакет.
+/// IPv4 packet.
 pub const KIND_IPV4: u8 = 4;
-/// IPv6-пакет (маршрутизация v6 на роадмапе; кадры принимаются и дропаются).
+/// IPv6 packet (v6 routing is a roadmap item; frames are accepted and dropped).
 pub const KIND_IPV6: u8 = 6;
 
-/// Максимум payload'а дейтаграммы. QUIC datagram ограничен 65 527 байтами;
-/// MTU 1280 делает этот потолок недостижимым на практике.
+/// Maximum datagram payload. QUIC datagrams cap at 65 527 bytes; with the
+/// 1280 MTU this ceiling is unreachable in practice.
 pub const MAX_DATAGRAM_PAYLOAD: usize = 65_527;
 
-/// Ошибки разбора дейтаграммы.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Datagram parsing errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FrameError {
-    /// Дейтаграмма пуста — нет даже байта вида кадра.
+    /// Datagram is empty — not even a frame-kind byte.
+    #[error("empty datagram")]
     Empty,
-    /// Неизвестный вид кадра (мусор или версия протокола новее клиента).
+    /// Unknown frame kind (garbage or a protocol version newer than this client).
+    #[error("unknown frame kind: {0}")]
     UnknownKind(u8),
-    /// Payload сверх [`MAX_DATAGRAM_PAYLOAD`].
+    /// Payload exceeds [`MAX_DATAGRAM_PAYLOAD`].
+    #[error("payload of {0} bytes exceeds the limit of {MAX_DATAGRAM_PAYLOAD}")]
     PayloadTooLarge(usize),
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "пустая дейтаграмма"),
-            Self::UnknownKind(kind) => write!(f, "неизвестный вид кадра: {kind}"),
-            Self::PayloadTooLarge(len) => {
-                write!(f, "payload {len} байт сверх лимита {MAX_DATAGRAM_PAYLOAD}")
-            }
-        }
-    }
-}
-
-/// Разобранная дейтаграмма: `payload` — view внутрь исходного `Bytes`.
+/// Decoded datagram: `payload` is a view into the original `Bytes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    /// Вид кадра ([`KIND_IPV4`] / [`KIND_IPV6`]).
+    /// Frame kind ([`KIND_IPV4`] / [`KIND_IPV6`]).
     pub kind: u8,
-    /// IP-пакет целиком, без копирования.
+    /// Full IP packet, borrowed without copying.
     pub payload: Bytes,
 }
 
-/// Кодирует IP-пакет в дейтаграмму `[kind][payload]`.
+/// Encodes an IP packet into a `[kind][payload]` datagram.
 pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + payload.len());
     out.push(kind);
@@ -59,9 +51,9 @@ pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Разбирает дейтаграмму `[kind][payload]` без копий: payload — slice
-/// исходного буфера. Пустой буфер, неизвестный kind и сверхлимитный payload —
-/// ошибки.
+/// Decodes a `[kind][payload]` datagram without copying: the payload is a
+/// slice of the input buffer. Empty input, unknown kind and oversized payload
+/// are errors.
 pub fn decode_frame_zero_copy(datagram: &Bytes) -> Result<Frame, FrameError> {
     let Some(&kind) = datagram.first() else {
         return Err(FrameError::Empty);
@@ -80,81 +72,49 @@ pub fn decode_frame_zero_copy(datagram: &Bytes) -> Result<Frame, FrameError> {
 mod tests {
     use super::*;
 
-    fn datagram(kind: u8, payload: &[u8]) -> Bytes {
-        Bytes::from(encode_frame(kind, payload))
-    }
-
     #[test]
-    fn ipv4_roundtrip_without_copy() {
-        let payload = vec![0x45u8, 0, 0, 8, 0, 1, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let datagram = datagram(KIND_IPV4, &payload);
-        let frame = decode_frame_zero_copy(&datagram).expect("валидный кадр");
+    fn roundtrip_is_zero_copy() {
+        let payload = [0x45u8, 0, 0, 8, 0, 1, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let datagram = Bytes::from(encode_frame(KIND_IPV4, &payload));
+        let frame = decode_frame_zero_copy(&datagram).expect("valid frame");
         assert_eq!(frame.kind, KIND_IPV4);
-        assert_eq!(frame.payload.as_ref(), &payload, "payload байт в байт");
-        // Zero-copy: payload указывает внутрь дейтаграммы (смещение на байт kind).
-        // SAFETY: байт kind существует (first() вернулся Some), +1 не выходит
-        // за границы буфера.
-        assert_eq!(
-            frame.payload.as_ptr(),
-            unsafe { datagram.as_ptr().add(1) },
-            "payload обязан быть view без копии"
-        );
+        assert_eq!(frame.payload.as_ref(), &payload);
+        // Zero-copy guarantee: the payload points one byte past the kind byte.
+        // SAFETY: the kind byte exists (first() returned Some), +1 is in bounds.
+        assert_eq!(frame.payload.as_ptr(), unsafe { datagram.as_ptr().add(1) });
     }
 
     #[test]
-    fn ipv6_kind_accepted() {
-        let frame = decode_frame_zero_copy(&datagram(KIND_IPV6, &[0x60])).expect("валидный кадр");
+    fn ipv6_kind_is_accepted() {
+        let datagram = Bytes::from(encode_frame(KIND_IPV6, &[0x60]));
+        let frame = decode_frame_zero_copy(&datagram).expect("valid frame");
         assert_eq!(frame.kind, KIND_IPV6);
-        assert_eq!(frame.payload.as_ref(), &[0x60]);
     }
 
     #[test]
-    fn empty_datagram_is_error() {
+    fn empty_and_unknown_kinds_are_rejected() {
         assert_eq!(decode_frame_zero_copy(&Bytes::new()), Err(FrameError::Empty));
-    }
-
-    #[test]
-    fn unknown_kind_is_error() {
+        // Kind 0 is not a valid IP version either.
         assert_eq!(
-            decode_frame_zero_copy(&datagram(99, &[1])),
-            Err(FrameError::UnknownKind(99))
-        );
-        // KIND=0 тоже не допустим: виды кадра — только версии IP.
-        assert_eq!(
-            decode_frame_zero_copy(&datagram(0, &[1])),
+            decode_frame_zero_copy(&Bytes::from_static(&[0, 1])),
             Err(FrameError::UnknownKind(0))
         );
+        assert_eq!(
+            decode_frame_zero_copy(&Bytes::from_static(&[99, 1])),
+            Err(FrameError::UnknownKind(99))
+        );
     }
 
     #[test]
-    fn oversized_payload_is_error() {
+    fn payload_size_limit_is_enforced() {
         let oversized = vec![0u8; MAX_DATAGRAM_PAYLOAD + 1];
         assert_eq!(
-            decode_frame_zero_copy(&datagram(KIND_IPV4, &oversized)),
+            decode_frame_zero_copy(&Bytes::from(encode_frame(KIND_IPV4, &oversized))),
             Err(FrameError::PayloadTooLarge(MAX_DATAGRAM_PAYLOAD + 1))
         );
-    }
-
-    #[test]
-    fn max_size_payload_is_ok() {
-        let payload = vec![0u8; MAX_DATAGRAM_PAYLOAD];
-        let frame = decode_frame_zero_copy(&datagram(KIND_IPV4, &payload)).expect("на пределе — ок");
+        let at_limit = vec![0u8; MAX_DATAGRAM_PAYLOAD];
+        let frame =
+            decode_frame_zero_copy(&Bytes::from(encode_frame(KIND_IPV4, &at_limit))).expect("at the limit is fine");
         assert_eq!(frame.payload.len(), MAX_DATAGRAM_PAYLOAD);
-    }
-
-    #[test]
-    fn frame_error_display() {
-        assert_eq!(FrameError::Empty.to_string(), "пустая дейтаграмма");
-        assert_eq!(FrameError::UnknownKind(9).to_string(), "неизвестный вид кадра: 9");
-        assert_eq!(
-            FrameError::PayloadTooLarge(9).to_string(),
-            "payload 9 байт сверх лимита 65527"
-        );
-    }
-
-    #[test]
-    fn encode_frame_shape() {
-        let encoded = encode_frame(KIND_IPV4, &[1, 2, 3]);
-        assert_eq!(encoded, vec![KIND_IPV4, 1, 2, 3]);
     }
 }

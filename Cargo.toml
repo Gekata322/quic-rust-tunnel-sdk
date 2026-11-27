@@ -13,27 +13,27 @@ rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# Внутренние крейты
+# Internal crates
 tunnel-proto = { path = "tunnel-proto" }
 
-# Асинхронный рантайм и транспорт
+# Async runtime and transport
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
-# Протокол и утилиты
+# Protocol and utilities
 bytes = "1"
 bincode = "2.0"
 thiserror = "2"
 tracing = "0.1"
 
-# FFI-биндинги
+# FFI bindings
 uniffi = { version = "0.32.2", features = ["cli"] }
 
-# Только для разработки/тестов
+# Dev/test only
 rcgen = "0.14"
 
-# release-профиль SDK: максимум скорости и минимальный размер
+# Release profile for the SDK: maximum speed, minimal size
 [profile.release]
 opt-level = 3
 lto = "thin"

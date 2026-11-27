@@ -1,31 +1,32 @@
-//! Разбор IPv4-заголовка и подмена адресов для loopback-эха.
+//! IPv4 header parsing and address rewriting for loopback echo.
 //!
-//! Ядро и сервер **не доверяют** полям заголовка: длина пакета проверяется
-//! против фактического размера буфера, а при эхе адреса перезаписываются —
-//! клиент с чужим `src` никогда не получит трафик другого клиента
-//! (анти-спуфинг). Контрольные суммы не пересчитываются: их валидацию делает
-//! ядро платформенного TUN, а loopback-эхо меняет только адреса.
+//! Neither the core nor the server trusts header fields: the packet length is
+//! validated against the actual buffer size, and echo replies have addresses
+//! rewritten, so a client sending a forged `src` can never receive another
+//! client's traffic (anti-spoofing). Checksums are not recomputed: validation
+//! belongs to the platform TUN kernel; loopback echo only swaps addresses.
 
-/// Длина минимального IPv4-заголовка (IHL=5, без опций).
+/// Length of the minimal IPv4 header (IHL=5, no options).
 pub const IPV4_HEADER_LEN: usize = 20;
 
-/// Разобранный IPv4-заголовок (только поля, нужные туннелю).
+/// Parsed IPv4 header (only the fields the tunnel needs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Header {
-    /// Версия IP (должна быть 4).
+    /// IP version (must be 4).
     pub version: u8,
-    /// Общая длина пакета по заголовку (заголовок + payload).
+    /// Total packet length per the header (header + payload).
     pub total_len: u16,
-    /// Адрес отправителя.
+    /// Sender address.
     pub src: [u8; 4],
-    /// Адрес получателя.
+    /// Receiver address.
     pub dst: [u8; 4],
-    /// Номер протокола верхнего уровня (6=TCP, 17=UDP).
+    /// Upper-layer protocol number (6=TCP, 17=UDP).
     pub protocol: u8,
 }
 
-/// Разбирает минимальные поля IPv4-заголовка. `None` — не IPv4-пакет,
-/// буфер короче заголовка или `total_len` противоречит фактической длине.
+/// Parses the minimal IPv4 header fields. Returns `None` for non-IPv4
+/// packets, buffers shorter than the header, or a `total_len` inconsistent
+/// with the actual buffer length.
 pub fn parse(buf: &[u8]) -> Option<Ipv4Header> {
     if buf.len() < IPV4_HEADER_LEN {
         return None;
@@ -43,25 +44,23 @@ pub fn parse(buf: &[u8]) -> Option<Ipv4Header> {
         return None;
     }
     let total_len = u16::from_be_bytes([buf[2], buf[3]]);
-    // total_len не может превышать фактическую длину буфера; буфер может
-    // быть длиннее (Ethernet-padding со стороны TUN — допустимо).
+    // total_len must not exceed the real buffer length; the buffer may be
+    // longer (Ethernet padding on the TUN side is acceptable).
     if usize::from(total_len) < header_len || usize::from(total_len) > buf.len() {
         return None;
     }
-    let src = [buf[12], buf[13], buf[14], buf[15]];
-    let dst = [buf[16], buf[17], buf[18], buf[19]];
     Some(Ipv4Header {
         version,
         total_len,
-        src,
-        dst,
+        src: [buf[12], buf[13], buf[14], buf[15]],
+        dst: [buf[16], buf[17], buf[18], buf[19]],
         protocol: buf[9],
     })
 }
 
-/// Подменяет адреса в IPv4-заголовке (loopback-эхо): `src` и `dst` пишутся
-/// в байты 12..20. Возвращает `false`, если буфер не валидный IPv4-пакет —
-/// адреса в таком случае не трогаются.
+/// Rewrites the source and destination addresses in an IPv4 header (loopback
+/// echo): both are written into bytes 12..20. Returns `false` when the buffer
+/// is not a valid IPv4 packet, leaving it untouched.
 pub fn rewrite_addresses(buf: &mut [u8], src: [u8; 4], dst: [u8; 4]) -> bool {
     if parse(buf).is_none() {
         return false;
@@ -75,7 +74,7 @@ pub fn rewrite_addresses(buf: &mut [u8], src: [u8; 4], dst: [u8; 4]) -> bool {
 mod tests {
     use super::*;
 
-    /// Собирает минимальный IPv4-заголовок + payload.
+    /// Builds a minimal IPv4 header + payload.
     fn packet(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut pkt = vec![0x45, 0x00, 0x00, 0x00, 0, 1, 0x40, 0x00, 64, 17, 0, 0];
         pkt[2..4].copy_from_slice(&((IPV4_HEADER_LEN + payload.len()) as u16).to_be_bytes());
@@ -87,8 +86,7 @@ mod tests {
 
     #[test]
     fn parse_valid_packet() {
-        let header = parse(&packet([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE, 0xAD]))
-            .expect("валидный пакет");
+        let header = parse(&packet([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE, 0xAD])).expect("valid packet");
         assert_eq!(header.version, 4);
         assert_eq!(header.src, [10, 66, 0, 2]);
         assert_eq!(header.dst, [10, 66, 0, 1]);
@@ -97,35 +95,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_short_buffer() {
-        assert!(parse(&[0x45, 0, 0, 20]).is_none(), "4 байта — не заголовок");
+    fn parse_rejects_short_and_non_ipv4_buffers() {
+        assert!(parse(&[0x45, 0, 0, 20]).is_none(), "4 bytes are not a header");
         assert!(parse(&[]).is_none());
-    }
-
-    #[test]
-    fn parse_rejects_non_ipv4() {
         let mut pkt = packet([1, 2, 3, 4], [5, 6, 7, 8], b"x");
-        pkt[0] = 0x65; // версия 6
-        assert!(parse(&pkt).is_none(), "версия 6 не разбирается ipv4-модулем");
+        pkt[0] = 0x65; // version 6
+        assert!(parse(&pkt).is_none(), "version 6 is not handled by the IPv4 parser");
     }
 
     #[test]
     fn parse_rejects_ihl_less_than_five() {
         let mut pkt = packet([1, 2, 3, 4], [5, 6, 7, 8], b"x");
-        pkt[0] = 0x44; // IHL=4 — заголовок короче минимального
+        pkt[0] = 0x44; // IHL=4: header shorter than the minimum
         assert!(parse(&pkt).is_none());
     }
 
     #[test]
-    fn parse_rejects_total_len_mismatch() {
+    fn parse_validates_total_len_against_buffer() {
         let mut pkt = packet([1, 2, 3, 4], [5, 6, 7, 8], &[0u8; 40]);
-        // total_len = 20 при фактической длине 60: payload обрезан — валидно.
+        // total_len = 20 with a 60-byte buffer: truncated payload is valid.
         pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
-        assert!(parse(&pkt).is_some(), "буфер длиннее total_len допустим");
-        // total_len больше буфера — противоречие.
+        assert!(parse(&pkt).is_some(), "a buffer longer than total_len is fine");
+        // total_len beyond the buffer is a contradiction.
         pkt[2..4].copy_from_slice(&6200u16.to_be_bytes());
-        assert!(parse(&pkt).is_none(), "total_len сверх буфера — мусор");
-        // total_len меньше заголовка — противоречие.
+        assert!(parse(&pkt).is_none(), "total_len beyond the buffer is garbage");
+        // total_len below the header length is a contradiction too.
         pkt[2..4].copy_from_slice(&8u16.to_be_bytes());
         assert!(parse(&pkt).is_none());
     }
@@ -134,17 +128,15 @@ mod tests {
     fn rewrite_addresses_swaps_and_validates() {
         let mut pkt = packet([10, 66, 0, 2], [10, 66, 0, 1], &[0xDE]);
         assert!(rewrite_addresses(&mut pkt, [10, 66, 0, 1], [10, 66, 0, 2]));
-        let header = parse(&pkt).expect("после перезаписи пакет валиден");
-        assert_eq!(header.src, [10, 66, 0, 1], "src → сервер");
-        assert_eq!(header.dst, [10, 66, 0, 2], "dst → клиент");
-        assert_eq!(&pkt[20..], &[0xDE], "payload не тронут");
+        let header = parse(&pkt).expect("packet stays valid after the rewrite");
+        assert_eq!(header.src, [10, 66, 0, 1], "src becomes the server");
+        assert_eq!(header.dst, [10, 66, 0, 2], "dst becomes the client");
+        assert_eq!(&pkt[20..], &[0xDE], "payload untouched");
     }
 
     #[test]
     fn rewrite_rejects_garbage() {
         let mut garbage = vec![0xFF; 8];
         assert!(!rewrite_addresses(&mut garbage, [1, 2, 3, 4], [5, 6, 7, 8]));
-        // Наличие мусора не означает, что адреса остались прежними —
-        // гарантируется только отсутствие перезаписи валидной части.
     }
 }
