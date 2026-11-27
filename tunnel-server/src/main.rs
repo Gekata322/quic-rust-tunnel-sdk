@@ -143,6 +143,12 @@ async fn async_run(cli: Cli) -> Result<(), RunError> {
     }
 
     shared.spawn_tun_reader();
+    shared.spawn_idle_reaper();
+    tracing::info!(
+        idle_timeout_secs = tunnel_server::reaper::IDLE_SESSION_TIMEOUT.as_secs(),
+        scan_interval_secs = tunnel_server::reaper::REAP_INTERVAL.as_secs(),
+        "idle-session reaper is running"
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -189,8 +195,9 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>, String> {
 
 flags:
   --listen <ip:port>        QUIC UDP address (default 0.0.0.0:443)
-  --tokens <file>           token file: one \"client_id:token\" pair per line
-  --env-tokens              read TUNNEL_TOKENS (\"a:t1,b:t2\")
+  --tokens <file>           token file: one \"client_id:token[:mbps]\" per line
+                            (the optional suffix caps the client, e.g. a:b:10mbps)
+  --env-tokens              read TUNNEL_TOKENS (\"a:t1,b:t2:5mbps\")
   --tun <name>              production mode: TUN interface (needs CAP_NET_ADMIN)
   --pool <cidr>             virtual address subnet (default 10.66.0.0/24)
   --mtu <n>                 client MTU (default 1280)
