@@ -13,6 +13,14 @@
 //!    - production mode: a client packet is written to the TUN; packets from
 //!      the TUN are routed to the client by the destination address.
 //!
+//! - **rate limiting**: a client with a configured bandwidth cap (the optional
+//!   `:mbps` suffix in `tokens.txt`) has its data plane throttled by the
+//!   per-session token bucket ([`crate::ratelimit`]); control traffic is
+//!   never throttled;
+//! - **idle reaping**: a session silent for [`crate::reaper::IDLE_SESSION_TIMEOUT`]
+//!   is force-closed by the background reaper and its address returns to the
+//!   pool.
+//!
 //! The address is returned to the pool on every session end — reuse.
 
 use std::net::Ipv4Addr;
@@ -33,6 +41,8 @@ use tunnel_proto::ipv4;
 
 use crate::config::ServerConfig;
 use crate::pool::IpPool;
+use crate::ratelimit::RateLimiter;
+use crate::reaper::SessionTracker;
 use crate::routing::RoutingTable;
 use crate::tun::TunDevice;
 
@@ -81,6 +91,10 @@ pub struct ServerShared {
     pool: IpPool,
     /// "Address → client" table.
     routing: RoutingTable,
+    /// Live sessions with their last inbound activity (the reaper's input).
+    sessions: SessionTracker,
+    /// Per-session data-plane token buckets.
+    limiter: RateLimiter,
     /// TUN interface of production mode (`None` — loopback).
     tun: Option<Arc<TunDevice>>,
 }
@@ -102,6 +116,8 @@ impl ServerShared {
             tokens,
             pool,
             routing: RoutingTable::new(),
+            sessions: SessionTracker::new(),
+            limiter: RateLimiter::new(),
             tun: tun.map(Arc::new),
         }))
     }
@@ -119,6 +135,37 @@ impl ServerShared {
     /// Number of active clients.
     pub fn active_clients(&self) -> usize {
         self.routing.active()
+    }
+
+    /// Number of pool addresses currently issued (tests and diagnostics).
+    pub fn allocated_addresses(&self) -> usize {
+        self.pool.allocated()
+    }
+
+    /// Spawns the idle-session reaper with the production timeouts (45s idle,
+    /// 5s scan — see [`crate::reaper`]).
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        crate::reaper::spawn_idle_reaper(self);
+    }
+
+    /// Force-closes the sessions silent for longer than `idle_timeout`: the
+    /// QUIC connection is closed, the route is removed and the virtual
+    /// address returns to the pool. Called by the reaper loop; public for
+    /// tests and ops tooling.
+    pub fn reap_idle_sessions(&self, idle_timeout: Duration) {
+        for (vip, stale) in self.sessions.take_idle(idle_timeout) {
+            let idle = stale.last_activity.elapsed();
+            tracing::info!(
+                client_id = %stale.client_id,
+                vip = %vip,
+                idle_secs = idle.as_secs(),
+                "idle session reaped — closing the connection and returning the address"
+            );
+            stale.conn.close(quinn::VarInt::from_u32(0), b"idle-reaped");
+            self.routing.unregister(vip, &stale.outbound_tx);
+            self.limiter.unregister(vip);
+            let _ = self.pool.release(vip);
+        }
     }
 
     /// Starts the TUN reader: packets from the kernel → clients by the `RoutingTable`.
@@ -216,6 +263,10 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
         return;
     }
 
+    // The bandwidth cap rides with the token: after a constant-time verify,
+    // look up this client's data-plane limit (`None` — unlimited).
+    let rate_limit_mbps = shared.tokens.limit_of(&client_id);
+
     let vip = match shared.pool.alloc() {
         Some(vip) => vip,
         None => {
@@ -236,6 +287,10 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
     // --- Welcome and client registration ---
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_LEN);
     shared.routing.register(vip, outbound_tx.clone());
+    // The session is tracked from here: even a client that stalls while
+    // reading `Welcome` stays reapable, so its address cannot leak.
+    shared.sessions.register(vip, &client_id, conn.clone(), outbound_tx.clone());
+    shared.limiter.register(vip, rate_limit_mbps);
 
     let welcome = ControlFromServer::Welcome(Welcome {
         vip,
@@ -261,63 +316,80 @@ pub async fn handle_connection(shared: Arc<ServerShared>, conn: quinn::Connectio
                     tracing::debug!(client_id = %client_id, %err, "control plane closed");
                     break;
                 }
-                Ok(buf) => match decode_control::<ControlFromClient>(&buf) {
-                    Err(err) => {
-                        tracing::debug!(client_id = %client_id, %err, "malformed control message");
-                        break;
-                    }
-                    Ok(None) => {
-                        tracing::debug!(client_id = %client_id, "truncated control message");
-                        break;
-                    }
-                    Ok(Some((ControlFromClient::Ping(Ping { seq, sent_unix_ms }), _))) => {
-                        let pong = ControlFromServer::Pong(Pong {
-                            seq,
-                            sent_unix_ms,
-                            server_unix_ms: unix_ms(),
-                        });
-                        if send.write_all(&encode_control(&pong)).await.is_err() {
+                Ok(buf) => {
+                    // Any inbound bytes prove the client is alive.
+                    shared.sessions.touch(vip);
+                    match decode_control::<ControlFromClient>(&buf) {
+                        Err(err) => {
+                            tracing::debug!(client_id = %client_id, %err, "malformed control message");
                             break;
                         }
+                        Ok(None) => {
+                            tracing::debug!(client_id = %client_id, "truncated control message");
+                            break;
+                        }
+                        Ok(Some((ControlFromClient::Ping(Ping { seq, sent_unix_ms }), _))) => {
+                            let pong = ControlFromServer::Pong(Pong {
+                                seq,
+                                sent_unix_ms,
+                                server_unix_ms: unix_ms(),
+                            });
+                            if send.write_all(&encode_control(&pong)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Some((other, _))) => {
+                            tracing::debug!(client_id = %client_id, ?other, "unexpected control message");
+                        }
                     }
-                    Ok(Some((other, _))) => {
-                        tracing::debug!(client_id = %client_id, ?other, "unexpected control message");
-                    }
-                },
+                }
             },
             datagram = conn.read_datagram() => match datagram {
                 Err(err) => {
                     tracing::debug!(client_id = %client_id, %err, "data plane closed");
                     break;
                 }
-                Ok(datagram) => match process_inbound(&shared, vip, &datagram) {
-                    PacketAction::Echo(reply) => {
-                        // Echo carries a raw IP packet — frame it as the data plane.
-                        if conn.send_datagram(Bytes::from(encode_frame(KIND_IPV4, &reply))).is_err() {
-                            break;
+                Ok(datagram) => {
+                    // Liveness counts even for datagrams the limiter drops.
+                    shared.sessions.touch(vip);
+                    if !shared.limiter.try_consume(vip, datagram.len()) {
+                        shared.metrics.record_rate_limited(1);
+                        tracing::debug!(
+                            client_id = %client_id,
+                            bytes = datagram.len(),
+                            "rate limit exceeded — datagram dropped"
+                        );
+                        continue;
+                    }
+                    match process_inbound(&shared, vip, &datagram) {
+                        PacketAction::Echo(reply) => {
+                            // Echo carries a raw IP packet — frame it as the data plane.
+                            if conn.send_datagram(Bytes::from(encode_frame(KIND_IPV4, &reply))).is_err() {
+                                break;
+                            }
+                        }
+                        PacketAction::Forward(packet) => {
+                            let Some(tun) = shared.tun.as_ref() else {
+                                tracing::debug!(client_id = %client_id, "packet without a TUN route — dropped");
+                                shared.metrics.record_packets_dropped(1);
+                                continue;
+                            };
+                            if let Err(err) = tun.write_packet(&packet).await {
+                                tracing::warn!(%err, "failed to write to the TUN");
+                                shared.metrics.record_packets_dropped(1);
+                            }
+                        }
+                        PacketAction::RouteTo(sender, packet) => {
+                            if sender.send(packet).await.is_err() {
+                                shared.metrics.record_packets_dropped(1);
+                            }
+                        }
+                        PacketAction::Drop(reason) => {
+                            tracing::debug!(client_id = %client_id, reason, "packet dropped");
+                            shared.metrics.record_packets_dropped(1);
                         }
                     }
-                    PacketAction::Forward(packet) => {
-                        let Some(tun) = shared.tun.as_ref() else {
-                            tracing::debug!(client_id = %client_id, "packet without a TUN route — dropped");
-                            shared.metrics.record_packets_dropped(1);
-                            continue;
-                        };
-                        if let Err(err) = tun.write_packet(&packet).await {
-                            tracing::warn!(%err, "failed to write to the TUN");
-                            shared.metrics.record_packets_dropped(1);
-                        }
-                    }
-                    PacketAction::RouteTo(sender, packet) => {
-                        if sender.send(packet).await.is_err() {
-                            shared.metrics.record_packets_dropped(1);
-                        }
-                    }
-                    PacketAction::Drop(reason) => {
-                        tracing::debug!(client_id = %client_id, reason, "packet dropped");
-                        shared.metrics.record_packets_dropped(1);
-                    }
-                },
+                }
             },
         }
     }
@@ -370,8 +442,12 @@ async fn read_hello(recv: &mut quinn::RecvStream) -> Result<Hello, Reject> {
     }
 }
 
-/// Returns the address to the pool and removes the route.
+/// Frees everything the session held: the tracker entry, the rate-limit
+/// bucket, the route and the virtual address. Every step is idempotent, so
+/// the reaper and the session task may clean up the same session safely.
 fn cleanup(shared: &Arc<ServerShared>, vip: Ipv4Addr, outbound_tx: &mpsc::Sender<Vec<u8>>) {
+    shared.sessions.remove(vip);
+    shared.limiter.unregister(vip);
     shared.routing.unregister(vip, outbound_tx);
     let _ = shared.pool.release(vip);
 }
@@ -510,8 +586,17 @@ mod tests {
         assert_eq!(shared.server_vip, Ipv4Addr::new(10, 66, 0, 1));
         assert!(shared.is_loopback());
         assert_eq!(shared.active_clients(), 0);
+        assert_eq!(shared.allocated_addresses(), 0);
         let snap = shared.metrics.snapshot();
         assert_eq!(snap.sessions_established, 0);
+    }
+
+    #[tokio::test]
+    async fn reap_idle_sessions_without_sessions_is_a_noop() {
+        let shared = shared_state();
+        shared.reap_idle_sessions(std::time::Duration::from_millis(1));
+        assert_eq!(shared.active_clients(), 0);
+        assert_eq!(shared.allocated_addresses(), 0);
     }
 
     #[test]
