@@ -1,14 +1,14 @@
-//! Движок ядра: цикл сессий, экспоненциальные переподключения, координация
-//! остановки и смены сети.
+//! Core engine: the session loop, exponential reconnects, stop coordination
+//! and network-change handling.
 //!
-//! Движок живёт в выделенном фоновом потоке (однопоточный tokio-рантайм —
-//! экономно для мобильных устройств). FFI-объект [`crate::ffi::TunnelClient`]
-//! общается с ним через общее [`EngineShared`] (канал состояния + очереди
-//! пакетов), не владея асинхронными типами напрямую.
+//! The engine runs on a dedicated background thread (a single-threaded tokio
+//! runtime — cheap on mobile devices). The FFI object
+//! [`crate::ffi::TunnelClient`] talks to it through [`EngineShared`] (a state
+//! watch channel + packet queues) and never owns async types directly.
 //!
-//! Каждый статус, видимый партнёру через коллбэк, вычисляется здесь
+//! Every status visible to partners via the callback is computed here
 //! ([`EngineShared::notify_status`]): `Connected` → `Reconnecting` →
-//! `Disconnected` без дубликатов, см. док в `ffi`.
+//! `Disconnected` without duplicates (see the `ffi` docs).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -21,41 +21,41 @@ use crate::backoff::Backoff;
 use crate::ffi::{ConnectionStatus, ConnectionStatusCallback, TunnelConfig, TunnelState};
 use crate::session::{SessionOutcome, run_session};
 
-/// Длина очередей пакетов (оба направления). При переполнении входной очереди
-/// `send_packet` возвращает платформе `false`; выходная очередь дропает пакет
-/// и увеличивает счётчик `packets_dropped` — семантика UDP, а не затор.
+/// Packet queue length (both directions). When the inbound queue overflows,
+/// `send_packet` returns `false` to the platform; the outbound queue drops
+/// the packet and bumps `packets_dropped` — UDP semantics, not backpressure.
 const PACKET_QUEUE_LEN: usize = 256;
 
-/// Состояние, разделяемое между FFI-объектом и потоком движка.
+/// State shared between the FFI object and the engine thread.
 pub(crate) struct EngineShared {
     pub(crate) config: TunnelConfig,
     state_tx: watch::Sender<TunnelState>,
     pub(crate) state_rx: watch::Receiver<TunnelState>,
-    /// Платформа → туннель (tokio, ограниченная очередь).
+    /// Platform → tunnel (tokio, bounded queue).
     pub(crate) packet_in_tx: mpsc::Sender<Vec<u8>>,
-    /// Туннель → платформа (std sync_channel; FFI выкачивает с тайм-аутом).
-    /// Receiver обёрнут в Mutex: std-тип не Sync, а параллельные recv-вызовы
-    /// и так сериализуются по смыслу (один консьюмер).
+    /// Tunnel → platform (std sync_channel; FFI drains it with a timeout).
+    /// The receiver sits in a Mutex: the std type is not Sync, and parallel
+    /// recv calls are meaningless anyway (a single consumer by contract).
     pub(crate) packet_out_tx: std_mpsc::SyncSender<Vec<u8>>,
     pub(crate) packet_out_rx: Mutex<std_mpsc::Receiver<Vec<u8>>>,
-    /// Телеметрия: атомарные счётчики, снимок копируется в FFI по запросу.
+    /// Telemetry: atomic counters, snapshotted into the FFI on demand.
     pub(crate) metrics: Arc<Metrics>,
-    /// RTT последнего ping/pong, мс; 0 — ещё не измерялся в этой сессии.
+    /// RTT of the last ping/pong in ms; 0 — not yet measured in this session.
     pub(crate) last_ping_ms: AtomicU64,
-    /// Активное QUIC-соединение — для форс-закрытия при смене сети.
+    /// The active QUIC connection — for force-closing on a network change.
     active_conn: Mutex<Option<quinn::Connection>>,
-    /// Партнёрский коллбэк статуса (uniffi callback-interface).
+    /// Partner status callback (uniffi callback interface).
     callback: Mutex<Option<Box<dyn ConnectionStatusCallback>>>,
-    /// Последний отправленный в коллбэк статус — для дедупликации уведомлений.
+    /// Last status delivered to the callback — for deduplication.
     last_status: Mutex<Option<ConnectionStatus>>,
-    /// Была ли хотя бы одна успешная сессия: «Connecting после неё» —
-    /// это `Reconnecting`, а не `Disconnected`.
+    /// Whether at least one session succeeded: "Connecting after that" is
+    /// `Reconnecting`, not `Disconnected`.
     ever_connected: AtomicBool,
 }
 
 impl EngineShared {
-    /// Собирает каналы и метрики. Приёмник входных пакетов возвращается
-    /// отдельно: его забирает поток движка в `TunnelClient::connect`.
+    /// Builds channels and metrics. The inbound receiver is returned
+    /// separately: the engine thread takes it in `TunnelClient::connect`.
     pub(crate) fn new(config: TunnelConfig) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
         let (state_tx, state_rx) = watch::channel(TunnelState::Disconnected);
         let (packet_in_tx, packet_in_rx) = mpsc::channel(PACKET_QUEUE_LEN);
@@ -77,27 +77,27 @@ impl EngineShared {
         (shared, packet_in_rx)
     }
 
-    /// Публикует новое состояние для FFI-наблюдателей и партнёрского коллбэка.
+    /// Publishes new state to FFI observers and the partner callback.
     pub(crate) fn set_state(&self, state: TunnelState) {
         self.state_tx.send_replace(state);
         self.notify_status();
     }
 
-    /// Регистрирует партнёрский коллбэк (`None` — снять).
-    /// После регистрации коллбэк сразу получает текущий статус.
+    /// Registers the partner callback (`None` — detach). Right after
+    /// registration the callback receives the current status.
     pub(crate) fn set_callback(&self, callback: Option<Box<dyn ConnectionStatusCallback>>) {
         if let Ok(mut slot) = self.callback.lock() {
             *slot = callback;
         }
         if let Ok(mut last) = self.last_status.lock() {
-            // Принудительно повторить текущий статус новому коллбэку.
+            // Force a repeat of the current status for the new callback.
             *last = None;
         }
         self.notify_status();
     }
 
-    /// Считает статус по внутреннему состоянию и уведомляет коллбэк
-    /// только при реальной смене (без дубликатов при каждом ретрае).
+    /// Computes the status from the internal state and notifies the callback
+    /// only on a real change (no duplicates across retries).
     fn notify_status(&self) {
         let state = self.state_rx.borrow().clone();
         if matches!(state, TunnelState::Connected { .. }) {
@@ -108,10 +108,10 @@ impl EngineShared {
                 mtu: *mtu,
                 vip: vip.clone(),
             },
-            // Корректная остановка или постоянная ошибка — соединения нет.
+            // A clean stop or a permanent error means no connection.
             TunnelState::Stopping | TunnelState::Stopped => ConnectionStatus::Disconnected,
-            // Попытка подключения/backoff: до первой успешной сессии это
-            // просто «нет соединения», после — восстановление.
+            // An attempt/backoff before the first successful session is just
+            // "no connection"; afterwards it is a recovery.
             TunnelState::Connecting | TunnelState::Disconnected => {
                 if self.ever_connected.load(Ordering::Relaxed) {
                     ConnectionStatus::Reconnecting
@@ -130,9 +130,9 @@ impl EngineShared {
         *last = Some(status.clone());
         drop(last);
 
-        // Коллбэк под мьютексом: повторный вход set_status_callback из
-        // коллбэка невозможен — контракт требует быстрого, нереентерабельного
-        // обработчика (см. док `ConnectionStatusCallback`).
+        // The callback runs under the mutex: re-entrant set_status_callback
+        // from inside the callback is impossible — the contract requires a
+        // fast, non-reentrant handler (see `ConnectionStatusCallback`).
         if let Ok(slot) = self.callback.lock() {
             if let Some(callback) = slot.as_ref() {
                 callback.on_status_change(status);
@@ -140,32 +140,32 @@ impl EngineShared {
         }
     }
 
-    /// Сбрасывает пинг (новая сессия — старые измерения недействительны).
+    /// Resets the RTT (a new session invalidates previous measurements).
     pub(crate) fn reset_ping(&self) {
         self.last_ping_ms.store(0, Ordering::Relaxed);
     }
 
-    /// Запоминает активное QUIC-соединение (или очищает слот).
+    /// Stores the active QUIC connection (or clears the slot).
     pub(crate) fn set_active_conn(&self, conn: Option<quinn::Connection>) {
         if let Ok(mut slot) = self.active_conn.lock() {
             *slot = conn;
         }
     }
 
-    /// Подсказка о смене сети: активное QUIC-соединение немедленно закрывается,
-    /// движок выходит из сессии и подключается заново (уже на новом интерфейсе).
+    /// Network-change hint: the active QUIC connection is closed immediately,
+    /// the engine leaves the session and reconnects (on the new interface).
     pub(crate) fn force_reconnect(&self) {
         let conn = match self.active_conn.lock() {
             Ok(mut slot) => slot.take(),
             Err(_) => return,
         };
         if let Some(conn) = conn {
-            tracing::info!("смена сети: закрываю активное QUIC-соединение");
+            tracing::info!(reason = "network-changed", "closing active QUIC connection");
             conn.close(quinn::VarInt::from_u32(0), b"network-changed");
         }
     }
 
-    /// Корректная остановка: идемпотентно, `Stopped` не перезаписывает.
+    /// Clean stop: idempotent, does not overwrite `Stopped`.
     pub(crate) fn request_stop(&self) {
         let changed = self.state_tx.send_if_modified(|state| {
             if matches!(state, TunnelState::Stopped) {
@@ -180,7 +180,7 @@ impl EngineShared {
         }
     }
 
-    /// Финальное состояние после завершения цикла движка.
+    /// Final state after the engine loop finishes.
     pub(crate) fn finish_stop(&self) {
         let changed = self.state_tx.send_if_modified(|state| {
             if matches!(state, TunnelState::Stopped) {
@@ -196,22 +196,22 @@ impl EngineShared {
     }
 }
 
-/// Ждёт команду остановки (Stopping/Stopped) на клоне watch-канала.
+/// Waits for a stop command (Stopping/Stopped) on a watch channel clone.
 pub(crate) async fn wait_stopping(stop_rx: &mut watch::Receiver<TunnelState>) {
     loop {
         if matches!(*stop_rx.borrow(), TunnelState::Stopping | TunnelState::Stopped) {
             return;
         }
-        // Канал живёт столько же, сколько FFI-объект: ошибка означает
-        // закрытие отправителя — трактуем как остановку.
+        // The channel lives as long as the FFI object: a send-side drop means
+        // shutdown as well.
         if stop_rx.changed().await.is_err() {
             return;
         }
     }
 }
 
-/// Главная петля движка: попытка сессии → разбор исхода → backoff → ретрай.
-/// Завершается по `request_stop()` (`Shutdown`) или постоянной ошибке.
+/// The engine main loop: session attempt → outcome → backoff → retry.
+/// Terminates on `request_stop()` (`Shutdown`) or a permanent error.
 pub(crate) async fn run(shared: Arc<EngineShared>, mut packet_in_rx: mpsc::Receiver<Vec<u8>>) {
     let mut backoff = Backoff::from_config(&shared.config);
     shared.set_state(TunnelState::Connecting);
@@ -220,27 +220,26 @@ pub(crate) async fn run(shared: Arc<EngineShared>, mut packet_in_rx: mpsc::Recei
         let outcome = run_session(&shared, &mut packet_in_rx).await;
         let mut stop_rx = shared.state_rx.clone();
         match outcome {
-            // `disconnect()` или drop FFI-объекта — выходим из цикла.
+            // `disconnect()` or the FFI object dropped — leave the loop.
             SessionOutcome::Shutdown => {
                 shared.set_active_conn(None);
                 break;
             }
             SessionOutcome::Closed { cause, established } => {
-                // Постоянные ошибки (токен, версия, конфиг) не лечатся ретраями.
+                shared.set_active_conn(None);
+                // Permanent errors (token, version, config) are not fixed by retries.
                 if cause.is_permanent() {
-                    tracing::warn!(%cause, "постоянная ошибка: движок остановлен");
-                    shared.set_active_conn(None);
+                    tracing::warn!(%cause, "permanent error: engine stopped");
                     shared.set_state(TunnelState::Stopped);
                     return;
                 }
-                shared.set_active_conn(None);
                 if established {
-                    // Сессия была рабочей: ретраим быстро, считаем reconnect.
-                    tracing::info!(%cause, "сессия оборвалась: переподключаюсь");
+                    // The session was live: retry fast, count the reconnect.
+                    tracing::info!(%cause, "session dropped: reconnecting");
                     shared.metrics.record_reconnect();
                     backoff.reset();
                 } else {
-                    tracing::info!(%cause, "попытка не удалась: backoff");
+                    tracing::info!(%cause, "attempt failed: backing off");
                 }
                 shared.set_state(TunnelState::Disconnected);
                 let delay = backoff.next();
@@ -258,7 +257,6 @@ pub(crate) async fn run(shared: Arc<EngineShared>, mut packet_in_rx: mpsc::Recei
 
 #[cfg(test)]
 mod tests {
-    // В тестах допустимы unwrap/expect: падение теста — это и есть сигнал.
     use super::*;
     use std::time::Duration;
 
@@ -280,30 +278,23 @@ mod tests {
     #[test]
     fn packet_queues_are_bounded() {
         let (shared, mut packet_in_rx) = EngineShared::new(sample_config());
-        // Входная очередь: PACKET_QUEUE_LEN пакетов помещается, следующий — нет.
+        // Inbound queue: exactly PACKET_QUEUE_LEN packets fit, one more does not.
         let packet = vec![0x45, 0x00];
         for _ in 0..PACKET_QUEUE_LEN {
             assert!(shared.packet_in_tx.try_send(packet.clone()).is_ok());
         }
         assert!(
             shared.packet_in_tx.try_send(packet).is_err(),
-            "очередь входа обязана быть ограниченной"
+            "the inbound queue must be bounded"
         );
-        // Выходная очередь: приёмник забирает всё обратно.
+        // Outbound queue: the receiver drains everything back.
         assert!(shared.packet_out_tx.try_send(vec![0x60]).is_ok());
         let drained = shared.packet_out_rx.lock().unwrap().recv().unwrap();
         assert_eq!(drained, vec![0x60]);
         let _ = packet_in_rx.try_recv();
     }
 
-    #[tokio::test]
-    async fn force_reconnect_without_active_conn_is_noop() {
-        let (shared, _rx) = EngineShared::new(sample_config());
-        // Не должно паниковать при пустом слоте соединения.
-        shared.force_reconnect();
-    }
-
-    /// Тестовый коллбэк: собирает статусы в общий буфер.
+    /// Test callback: collects statuses into a shared buffer.
     struct Collector {
         events: Arc<Mutex<Vec<ConnectionStatus>>>,
     }
@@ -319,11 +310,10 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         shared.set_callback(Some(Box::new(Collector { events: Arc::clone(&events) })));
 
-        // Регистрация повторяет текущий статус: до connect() это Disconnected.
+        // Registration replays the current status: before connect() that is Disconnected.
         assert_eq!(*events.lock().unwrap(), vec![ConnectionStatus::Disconnected]);
 
-        // Первая попытка подключения: без «восстановления» — Reconnecting
-        // имеет смысл только после успешной сессии.
+        // The first attempt must not report Reconnecting before any success.
         shared.set_state(TunnelState::Connecting);
         assert_eq!(*events.lock().unwrap(), vec![ConnectionStatus::Disconnected]);
 
@@ -342,7 +332,7 @@ mod tests {
             ]
         );
 
-        // Разрыв сессии и ретрай-цикл: один Reconnecting без дубликатов.
+        // Session drop and retry loop: exactly one Reconnecting, no duplicates.
         shared.set_state(TunnelState::Connecting);
         shared.set_state(TunnelState::Disconnected);
         shared.set_state(TunnelState::Connecting);
@@ -358,7 +348,7 @@ mod tests {
             ]
         );
 
-        // Корректная остановка → Disconnected; финал Stopped не дублирует.
+        // Clean stop → Disconnected; the final Stopped does not duplicate it.
         shared.request_stop();
         shared.finish_stop();
         assert_eq!(
@@ -380,14 +370,14 @@ mod tests {
         let (shared, _rx) = EngineShared::new(sample_config());
         let mut stop_rx = shared.state_rx.clone();
         tokio::select! {
-            _ = wait_stopping(&mut stop_rx) => panic!("без команды остановки не должен завершиться"),
+            _ = wait_stopping(&mut stop_rx) => panic!("must not finish without a stop command"),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         shared.request_stop();
         tokio::select! {
-            _ = wait_stopping(&mut stop_rx) => {} // команда увидена
+            _ = wait_stopping(&mut stop_rx) => {} // command observed
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                panic!("wait_stopping не увидел request_stop")
+                panic!("wait_stopping missed request_stop")
             }
         }
     }

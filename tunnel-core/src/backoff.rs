@@ -1,27 +1,26 @@
-//! Экспоненциальный backoff с джиттером: пауза между ретраями подключения.
+//! Exponential backoff with jitter: the pause between connection retries.
 //!
-//! Политика: первая задержка — `min_backoff_ms`, каждая следующая удваивается
-//! до `max_backoff_ms`; к результату добавляется случайный джиттер ±20%, чтобы
-//! флот клиентов после перезапуска сервера не атаковал его синхронной волной
-//! (thundering herd). После успешной сессии счётчик сбрасывается: разрыв через
-//! секунду работы — не повод ждать 30 секунд до первого ретрая.
+//! Policy: the first delay is `min_backoff_ms`, each subsequent one doubles up
+//! to `max_backoff_ms`; ±20% random jitter prevents the client fleet from
+//! attacking the server in a synchronized wave after a restart (thundering
+//! herd). A successful session resets the counter: a drop after one second of
+//! work must not wait 30 seconds for the first retry.
 
 use std::time::Duration;
 
 use crate::ffi::TunnelConfig;
 
-/// Экспоненциальная задержка с джиттером.
+/// Exponential delay with jitter.
 pub(crate) struct Backoff {
     min: Duration,
     max: Duration,
-    /// База без джиттера: растёт x2 при каждом `next`, сбрасывается `reset`.
+    /// Base without jitter: doubles on every `next`, resets on `reset`.
     base: Duration,
-    /// Псевдослучайное состояние (xorshift) — детерминируемо в тестах.
+    /// Pseudorandom state (xorshift) — deterministic in tests.
     seed: u64,
 }
 
 impl Backoff {
-    /// Собирает backoff из конфигурации клиента (мс → Duration).
     pub(crate) fn from_config(config: &TunnelConfig) -> Self {
         Self::new(config.min_backoff_ms, config.max_backoff_ms)
     }
@@ -33,38 +32,36 @@ impl Backoff {
             min,
             max,
             base: min,
-            seed: 0x9E37_79B9_7F4A_7C15, // фиксированный «золотой» семпл
+            seed: 0x9E37_79B9_7F4A_7C15,
         }
     }
 
-    /// Следующий xorshift-шаг: псевдослучайный [0..1) без внешних крейтов.
+    /// Next xorshift step: pseudorandom [0..1) with no external crates.
     fn jitter_unit(&mut self) -> f64 {
-        // xorshift64*: хватает для джиттера, детерминируемо для тестов.
         self.seed ^= self.seed >> 12;
         self.seed ^= self.seed << 25;
         self.seed ^= self.seed >> 27;
         (self.seed >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Следующая задержка: base * 2^i, с джиттером ±20%, с потолком `max`.
+    /// Next delay: base * 2^i with ±20% jitter, capped at `max`.
     pub(crate) fn next(&mut self) -> Duration {
         let jittered = (self.base.as_millis() as f64) * (0.8 + 0.4 * self.jitter_unit());
         let millis = jittered.clamp(
             self.min.as_millis() as f64,
             self.max.as_millis() as f64,
         );
-        // База растёт только до max: последующие next() остаются у потолка
-        // (с новым джиттером каждый раз).
+        // The base grows only up to `max`, so subsequent next() calls stay at
+        // the ceiling (with fresh jitter each time).
         self.base = (self.base * 2).min(self.max);
         Duration::from_millis(millis as u64)
     }
 
-    /// Сброс после успешной сессии: следующая задержка снова минимальная.
+    /// Reset after a successful session: the next delay is minimal again.
     pub(crate) fn reset(&mut self) {
         self.base = self.min;
     }
 
-    /// Текущая база (без джиттера) — для тестов.
     #[cfg(test)]
     pub(crate) fn base(&self) -> Duration {
         self.base
@@ -81,7 +78,7 @@ mod tests {
         let delay = backoff.next();
         assert!(
             delay >= Duration::from_millis(400) && delay <= Duration::from_millis(600),
-            "первая задержка около 500мс ±20%: {delay:?}"
+            "first delay must be ~500ms ±20%: {delay:?}"
         );
     }
 
@@ -93,7 +90,7 @@ mod tests {
             backoff.next();
             bases.push(backoff.base());
         }
-        // База удваивается до потолка 1600мс и дальше не растёт.
+        // The base doubles up to the 1600ms ceiling and stays there.
         assert_eq!(bases, vec![
             Duration::from_millis(200),
             Duration::from_millis(400),
@@ -108,15 +105,15 @@ mod tests {
 
     #[test]
     fn jitter_stays_within_bounds() {
-        // Джиттер ±20% применяется к ТЕКУЩЕЙ базе; проверяем его на
-        // минимальной базе — reset перед каждым шагом держит base = min.
+        // Jitter applies ±20% to the current base; reset before each step
+        // keeps base = min so the bound is checkable.
         let mut backoff = Backoff::new(500, 30_000);
         for _ in 0..20 {
             backoff.reset();
             let delay = backoff.next();
             assert!(
                 delay >= Duration::from_millis(400) && delay <= Duration::from_millis(600),
-                "джиттер выскочил за ±20% от min-базы: {delay:?}"
+                "jitter escaped ±20% of the min base: {delay:?}"
             );
         }
     }
@@ -127,13 +124,13 @@ mod tests {
         for _ in 0..4 {
             backoff.next();
         }
-        assert!(backoff.base() > Duration::from_millis(500), "база выросла");
+        assert!(backoff.base() > Duration::from_millis(500), "base must have grown");
         backoff.reset();
         assert_eq!(backoff.base(), Duration::from_millis(500));
         let delay = backoff.next();
         assert!(
             delay <= Duration::from_millis(600),
-            "после reset задержка снова у минимума: {delay:?}"
+            "after reset the delay is back at the minimum: {delay:?}"
         );
     }
 
@@ -142,7 +139,7 @@ mod tests {
         let mut backoff = Backoff::new(1, 8);
         for _ in 0..20 {
             let delay = backoff.next();
-            assert!(delay <= Duration::from_millis(9), "потолок 8мс +джиттер: {delay:?}");
+            assert!(delay <= Duration::from_millis(9), "ceiling 8ms + jitter: {delay:?}");
         }
     }
 }
