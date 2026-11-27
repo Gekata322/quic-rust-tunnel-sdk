@@ -9,11 +9,16 @@
 //!   Welcome/Reject` handshake, the control plane (ping/pong), the data plane
 //!   (datagrams ⇄ [`routing`]/[`tun`]);
 //! - [`pool`] — the virtual IP pool with address reuse;
-//! - [`routing`] — the "assigned address → client" table.
+//! - [`routing`] — the "assigned address → client" table;
+//! - [`ratelimit`] — per-client token-bucket caps for the data plane;
+//! - [`reaper`] — the idle-session reaper that protects the address pool
+//!   from clients that vanished without a close.
 
 pub mod config;
 pub mod endpoint;
 pub mod pool;
+pub mod ratelimit;
+pub mod reaper;
 pub mod routing;
 pub mod session;
 pub mod tun;

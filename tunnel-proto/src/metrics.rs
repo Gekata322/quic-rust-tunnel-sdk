@@ -12,6 +12,7 @@ pub struct Metrics {
     datagrams_sent: AtomicU64,
     datagrams_received: AtomicU64,
     packets_dropped: AtomicU64,
+    rate_limited: AtomicU64,
     sessions_established: AtomicU64,
     reconnects: AtomicU64,
 }
@@ -42,6 +43,12 @@ impl Metrics {
         self.packets_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records data-plane datagrams dropped by the per-client rate limiter
+    /// (the configured bandwidth cap was exhausted).
+    pub fn record_rate_limited(&self, n: u64) {
+        self.rate_limited.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records an established session (after `Welcome`).
     pub fn record_session_established(&self) {
         self.sessions_established.fetch_add(1, Ordering::Relaxed);
@@ -62,6 +69,7 @@ impl Metrics {
             datagrams_sent: load(&self.datagrams_sent),
             datagrams_received: load(&self.datagrams_received),
             packets_dropped: load(&self.packets_dropped),
+            rate_limited: load(&self.rate_limited),
             sessions_established: load(&self.sessions_established),
             reconnects: load(&self.reconnects),
         }
@@ -81,6 +89,8 @@ pub struct MetricsSnapshot {
     pub datagrams_received: u64,
     /// Packets dropped (queue overflow, garbage frames).
     pub packets_dropped: u64,
+    /// Data-plane datagrams dropped by the rate limiter (bandwidth cap).
+    pub rate_limited: u64,
     /// Established sessions (handshakes ending with `Welcome`).
     pub sessions_established: u64,
     /// Reconnects after an established session dropped.
@@ -106,6 +116,7 @@ mod tests {
         metrics.record_datagram_sent();
         metrics.record_datagram_received();
         metrics.record_packets_dropped(3);
+        metrics.record_rate_limited(7);
         metrics.record_session_established();
         metrics.record_reconnect();
 
@@ -115,6 +126,7 @@ mod tests {
         assert_eq!(snap.datagrams_sent, 2);
         assert_eq!(snap.datagrams_received, 1);
         assert_eq!(snap.packets_dropped, 3);
+        assert_eq!(snap.rate_limited, 7);
         assert_eq!(snap.sessions_established, 1);
         assert_eq!(snap.reconnects, 1);
 
