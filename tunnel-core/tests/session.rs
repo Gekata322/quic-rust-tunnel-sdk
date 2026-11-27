@@ -1,10 +1,11 @@
-//! Интеграционный тест полного стека `tunnel-core`: локальный QUIC-сервер
-//! («эхо» + валидный control plane) против реального движка с FFI-обёрткой.
+//! Integration test of the full `tunnel-core` stack: a local QUIC server
+//! ("echo" + a valid control plane) against the real engine with its FFI
+//! wrapper.
 //!
-//! Проверяются: рукопожатие с токеном и выдача MTU, обмен пакетами через
-//! `send_packet`/`recv_packet`, телеметрия с RTT, коллбэк статуса
-//! (`Disconnected → Connected → Disconnected`), остановка, а также сценарий
-//! отклонённого токена (движок обязан перейти в `Stopped` без ретраев).
+//! Covered: the handshake with a token and the server MTU, packet exchange
+//! via `send_packet`/`recv_packet`, telemetry with RTT, the status callback
+//! (`Disconnected → Connected → Disconnected`), graceful stop, and the
+//! rejected-token scenario (the engine must move to `Stopped` without retries).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -20,8 +21,8 @@ use tunnel_proto::{
     ALPN_TUNNEL_V1,
 };
 
-/// Инициализация логов: движок логирует через tracing, в тестах нужен
-/// subscriber — иначе диагностика отказов глотается молча.
+/// Log initialization: the engine logs via tracing; tests need a subscriber —
+/// otherwise failure diagnostics are swallowed silently.
 static LOGS: std::sync::Once = std::sync::Once::new();
 fn init_logs() {
     LOGS.call_once(|| {
@@ -32,41 +33,41 @@ fn init_logs() {
     });
 }
 
-/// Поведение тестового сервера.
+/// Behavior of the test server.
 #[derive(Clone, Copy)]
 enum ServerMode {
-    /// Валидный сервер: `Welcome`, `Pong` на ping, эхо дейтаграмм data plane.
+    /// Valid server: `Welcome`, `Pong` on ping, byte-for-byte datagram echo.
     Echo,
-    /// Всегда `Reject{InvalidToken}` — проверка permanent-остановки движка.
+    /// Always `Reject{InvalidToken}` — verifies the engine's permanent stop.
     RejectAll,
 }
 
-/// Поднимает локальный QUIC-сервер с самоподписанным сертификатом.
-/// Возвращает адрес и DER сертификата (он же — pinned root клиента).
+/// Spawns a local QUIC server with a self-signed certificate.
+/// Returns the address and the certificate DER (also the client's pinned root).
 async fn spawn_server(mode: ServerMode) -> (SocketAddr, Vec<u8>) {
     let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".to_owned()]).expect("самоподписанный сертификат");
+        generate_simple_self_signed(vec!["localhost".to_owned()]).expect("self-signed certificate");
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("дефолтные версии TLS")
+        .expect("default TLS versions")
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key_der)
-        .expect("сертификат и ключ");
+        .expect("certificate and key");
     tls.alpn_protocols = vec![ALPN_TUNNEL_V1.to_vec()];
 
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("QUIC поверх TLS"),
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("QUIC over TLS"),
     ));
     let endpoint = quinn::Endpoint::server(
         server_config,
-        "127.0.0.1:0".parse().expect("bind-адрес"),
+        "127.0.0.1:0".parse().expect("bind address"),
     )
-    .expect("UDP-эндпоинт сервера");
-    let addr = endpoint.local_addr().expect("локальный адрес");
+    .expect("server UDP endpoint");
+    let addr = endpoint.local_addr().expect("local address");
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             match incoming.await {
@@ -80,7 +81,7 @@ async fn spawn_server(mode: ServerMode) -> (SocketAddr, Vec<u8>) {
     (addr, cert_der.as_ref().to_vec())
 }
 
-/// Читает одно управляющее сообщение (префикс длины + тело bincode).
+/// Reads one control message (length prefix + bincode body).
 async fn read_control(recv: &mut quinn::RecvStream) -> Option<Vec<u8>> {
     let mut prefix = [0u8; 4];
     recv.read_exact(&mut prefix).await.ok()?;
@@ -92,8 +93,8 @@ async fn read_control(recv: &mut quinn::RecvStream) -> Option<Vec<u8>> {
     Some(full)
 }
 
-/// Обработка подключения тестовым сервером: рукопожатие, затем control plane
-/// (Pong на Ping) и data plane (эхо дейтаграмм как есть — byte-for-byte).
+/// Connection handling by the test server: handshake, then the control plane
+/// (Pong on Ping) and the data plane (datagram echo as-is, byte-for-byte).
 async fn handle_connection(mode: ServerMode, conn: quinn::Connection) {
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
@@ -114,22 +115,23 @@ async fn handle_connection(mode: ServerMode, conn: quinn::Connection) {
         ServerMode::RejectAll => {
             let reject = Reject {
                 code: RejectCode::InvalidToken,
-                message: format!("токен не найден для {}", hello.1),
+                message: format!("no token for {}", hello.1),
             };
             let _ = send.write_all(&encode_control(&ControlFromServer::Reject(reject))).await;
             let _ = send.finish();
-            // Дрейн: дать клиенту прочитать Reject до закрытия соединения —
-            // иначе CONNECTION_CLOSE обгоняет данные потока (см. сервер).
+            // Drain: give the client a chance to read the Reject before the
+            // connection closes — otherwise CONNECTION_CLOSE overtakes the
+            // stream data (see the server code).
             let _ = tokio::time::timeout(std::time::Duration::from_millis(200), conn.closed()).await;
             return;
         }
         ServerMode::Echo => {}
     }
-    // Токен «test» валиден для Echo-режима (используется в тестах ниже).
+    // The token "test" is valid in Echo mode (used by the tests below).
     if hello.0 != "test" && hello.0 != "tok" {
         let reject = Reject {
             code: RejectCode::InvalidToken,
-            message: "неизвестный токен".to_owned(),
+            message: "unknown token".to_owned(),
         };
         let _ = send.write_all(&encode_control(&ControlFromServer::Reject(reject))).await;
         let _ = send.finish();
@@ -150,7 +152,7 @@ async fn handle_connection(mode: ServerMode, conn: quinn::Connection) {
         return;
     }
 
-    // Две плоскости, пока соединение живо: control и data.
+    // Two planes while the connection is alive: control and data.
     loop {
         tokio::select! {
             message = read_control(&mut recv) => match message {
@@ -181,7 +183,7 @@ async fn handle_connection(mode: ServerMode, conn: quinn::Connection) {
     }
 }
 
-/// Конфиг клиента против тестового сервера (быстрые тайм-ауты для тестов).
+/// Client config against the test server (fast timeouts for tests).
 fn test_config(addr: SocketAddr, cert_der: Vec<u8>) -> TunnelConfig {
     TunnelConfig {
         server_host: addr.ip().to_string(),
@@ -197,7 +199,7 @@ fn test_config(addr: SocketAddr, cert_der: Vec<u8>) -> TunnelConfig {
     }
 }
 
-/// Крутится до состояния, удовлетворяющего `predicate`, с общим дедлайном.
+/// Polls until the state satisfies `predicate`, with a shared deadline.
 async fn wait_state(
     client: &TunnelClient,
     predicate: impl Fn(&TunnelState) -> bool,
@@ -211,31 +213,31 @@ async fn wait_state(
         }
         assert!(
             Instant::now() < deadline,
-            "состояние не достигнуто за {secs}с, текущее: {state:?}"
+            "state not reached within {secs}s, current: {state:?}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// Ждёт, пока последний статус коллбэка удовлетворит `predicate`.
+/// Waits until the last callback status satisfies `predicate`.
 async fn wait_status(events: &Mutex<Vec<ConnectionStatus>>, predicate: impl Fn(&[ConnectionStatus]) -> bool, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        if predicate(&events.lock().expect("буфер событий")) {
+        if predicate(&events.lock().expect("event buffer")) {
             return;
         }
-        assert!(Instant::now() < deadline, "статус не достигнут за {secs}с");
+        assert!(Instant::now() < deadline, "status not reached within {secs}s");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// Тестовый коллбэк: собирает статусы в общий буфер.
+/// Test callback: collects statuses into a shared buffer.
 struct Collector {
     events: Arc<Mutex<Vec<ConnectionStatus>>>,
 }
 impl ConnectionStatusCallback for Collector {
     fn on_status_change(&self, status: ConnectionStatus) {
-        self.events.lock().expect("буфер событий").push(status);
+        self.events.lock().expect("event buffer").push(status);
     }
 }
 
@@ -243,25 +245,25 @@ impl ConnectionStatusCallback for Collector {
 async fn echo_roundtrip_over_full_stack() {
     init_logs();
     let (addr, cert_der) = spawn_server(ServerMode::Echo).await;
-    let client = Arc::new(TunnelClient::new(test_config(addr, cert_der)).expect("клиент"));
+    let client = Arc::new(TunnelClient::new(test_config(addr, cert_der)).expect("client"));
 
-    // Коллбэк статуса: до connect() приходит Disconnected, затем Connected.
+    // Status callback: Disconnected arrives before connect(), then Connected.
     let events = Arc::new(Mutex::new(Vec::new()));
     client.set_status_callback(Some(Box::new(Collector { events: Arc::clone(&events) })));
-    assert_eq!(*events.lock().expect("буфер"), vec![ConnectionStatus::Disconnected]);
+    assert_eq!(*events.lock().expect("buffer"), vec![ConnectionStatus::Disconnected]);
 
-    client.connect().expect("старт движка");
+    client.connect().expect("engine start");
 
-    // Рукопожатие завершено, MTU сервера доехал до состояния.
+    // Handshake done, the server MTU reached the state.
     let state = wait_state(&client, |s| matches!(s, TunnelState::Connected { .. }), 5).await;
     assert!(
         matches!(state, TunnelState::Connected { mtu: 1280, .. }),
-        "неожиданный state: {state:?}"
+        "unexpected state: {state:?}"
     );
     assert_eq!(client.negotiated_mtu(), Some(1280));
     assert_eq!(client.negotiated_vip(), Some("10.66.0.2".to_owned()));
 
-    // Коллбэки: ровно один Connected с параметрами сервера.
+    // Callbacks: exactly one Connected with the server parameters.
     wait_status(&events, |e| {
         matches!(
             e.last(),
@@ -269,10 +271,10 @@ async fn echo_roundtrip_over_full_stack() {
         )
     }, 5).await;
 
-    // Обмен пакетом через poll-модель; recv вызываем из стороннего потока,
-    // как это будет делать платформенный код.
+    // Packet exchange through the poll model; recv runs on a side thread the
+    // way the platform code will do it.
     let packet = vec![0x45, 0x00, 0x00, 0x08, 0xAA, 0xBB];
-    assert!(client.send_packet(packet.clone()), "очередь не должна быть полна");
+    assert!(client.send_packet(packet.clone()), "the queue must not be full");
     let (tx, rx) = tokio::sync::oneshot::channel();
     let recv_client = Arc::clone(&client);
     std::thread::spawn(move || {
@@ -280,19 +282,19 @@ async fn echo_roundtrip_over_full_stack() {
     });
     let echoed = tokio::time::timeout(Duration::from_secs(5), rx)
         .await
-        .expect("поток приёма не завис")
-        .expect("recv_packet не ошибся")
-        .expect("эхо не пришло");
-    assert_eq!(echoed, packet, "эхо должно вернуть пакет байт в байт");
+        .expect("the receive thread did not hang")
+        .expect("recv_packet did not fail")
+        .expect("no echo arrived");
+    assert_eq!(echoed, packet, "the echo must return the packet byte for byte");
 
-    // Телеметрия: трафик и пинг (сервер ответил на первый ping, интервал 1с).
+    // Telemetry: traffic and ping (the server answered the first ping, 1s interval).
     let deadline = Instant::now() + Duration::from_secs(4);
     let telemetry = loop {
         let telemetry = client.get_telemetry();
         if telemetry.ping_ms.is_some() {
             break telemetry;
         }
-        assert!(Instant::now() < deadline, "пинг не измерился за 4с");
+        assert!(Instant::now() < deadline, "ping not measured within 4s");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(
@@ -305,7 +307,7 @@ async fn echo_roundtrip_over_full_stack() {
     );
     assert!(telemetry.ping_ms.is_some(), "telemetry: {telemetry:?}");
 
-    // Остановка: движок доходит до Stopped, коллбэк видит Disconnected.
+    // Stop: the engine reaches Stopped, the callback sees Disconnected.
     client.disconnect();
     wait_state(&client, |s| matches!(s, TunnelState::Stopped), 5).await;
     wait_status(&events, |e| {
@@ -317,18 +319,18 @@ async fn echo_roundtrip_over_full_stack() {
 async fn invalid_token_stops_engine_without_retries() {
     init_logs();
     let (addr, cert_der) = spawn_server(ServerMode::RejectAll).await;
-    let client = TunnelClient::new(test_config(addr, cert_der)).expect("клиент");
-    client.connect().expect("старт движка");
+    let client = TunnelClient::new(test_config(addr, cert_der)).expect("client");
+    client.connect().expect("engine start");
 
-    // AuthRejected — постоянная ошибка: сразу Stopped, без ретраев.
+    // AuthRejected is a permanent error: straight to Stopped, no retries.
     wait_state(&client, |s| matches!(s, TunnelState::Stopped), 5).await;
 
-    // Повторный connect не поднимает движок после постоянной ошибки.
-    client.connect().expect("connect идемпотентен");
+    // A repeated connect does not revive the engine after a permanent error.
+    client.connect().expect("connect is idempotent");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         client.state(),
         TunnelState::Stopped,
-        "после отклонённого токена ретраев быть не должно"
+        "there must be no retries after a rejected token"
     );
 }
