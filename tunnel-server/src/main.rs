@@ -203,7 +203,9 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>, String> {
     let mut admin_key: Option<String> = None;
 
     let usage = "usage:
-  tunnel-server --listen 0.0.0.0:443 --tokens tokens.txt \\\n      --tun tunnel0 --pool 10.66.0.0/24 --mtu 1280 \\\n      --server-name tunnel.example.com --export-cert tunnel-root.der
+  tunnel-server --listen 0.0.0.0:443 --tokens tokens.txt \\
+      --tun tunnel0 --pool 10.66.0.0/24 --mtu 1280 \\
+      --server-name tunnel.example.com --export-cert tunnel-root.der
   tunnel-server --listen 127.0.0.1:4433 --env-tokens   # loopback mode
   tunnel-server --env-tokens --admin-listen 127.0.0.1:8080 --admin-key SECRET
 
