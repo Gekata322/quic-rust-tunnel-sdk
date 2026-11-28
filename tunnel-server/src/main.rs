@@ -11,10 +11,11 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::watch;
 use tunnel_proto::auth::TokenStore;
-use tunnel_server::config::{ServerConfig, TokensSource};
+use tunnel_server::config::{AdminConfig, ServerConfig, TokensSource};
 use tunnel_server::endpoint::{accept_loop, build_endpoint, generate_certificate};
 use tunnel_server::session::ServerShared;
 use tunnel_server::tun::TunDevice;
@@ -46,6 +47,9 @@ enum RunError {
     /// No tokens loaded — the server would reject everyone.
     #[error("no tokens loaded: the server would reject every client (see --tokens/--env-tokens)")]
     NoTokens,
+    /// The admin HTTP listener did not bind.
+    #[error("admin API: {0}")]
+    Admin(#[from] tunnel_server::admin::AdminError),
     /// Certificate DER export failed.
     #[error("exporting the certificate to {0}: {1}")]
     CertExport(PathBuf, #[source] std::io::Error),
@@ -158,6 +162,14 @@ async fn async_run(cli: Cli) -> Result<(), RunError> {
         }
     });
 
+    // The admin API stops with the same shutdown signal as the accept loop.
+    if let Some(admin) = &config.admin {
+        let bound =
+            tunnel_server::admin::spawn_admin_server(Arc::clone(&shared), admin, shutdown_rx.clone())
+                .await?;
+        tracing::info!(addr = %bound, "admin HTTP API is up");
+    }
+
     accept_loop(shared, endpoint, shutdown_rx).await;
     tracing::info!("server stopped");
     Ok(())
@@ -184,14 +196,16 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>, String> {
         tun_name: None,
         server_name: "tunnel-server".to_owned(),
         tokens: TokensSource::Env,
+        admin: None,
     };
     let mut export_cert = None;
+    let mut admin_listen: Option<std::net::SocketAddr> = None;
+    let mut admin_key: Option<String> = None;
 
     let usage = "usage:
-  tunnel-server --listen 0.0.0.0:443 --tokens tokens.txt \\
-      --tun tunnel0 --pool 10.66.0.0/24 --mtu 1280 \\
-      --server-name tunnel.example.com --export-cert tunnel-root.der
+  tunnel-server --listen 0.0.0.0:443 --tokens tokens.txt \\\n      --tun tunnel0 --pool 10.66.0.0/24 --mtu 1280 \\\n      --server-name tunnel.example.com --export-cert tunnel-root.der
   tunnel-server --listen 127.0.0.1:4433 --env-tokens   # loopback mode
+  tunnel-server --env-tokens --admin-listen 127.0.0.1:8080 --admin-key SECRET
 
 flags:
   --listen <ip:port>        QUIC UDP address (default 0.0.0.0:443)
@@ -205,6 +219,9 @@ flags:
   --dns <a,b,c>             DNS servers recommended to clients
   --server-name <name>      certificate SAN / SNI (default tunnel-server)
   --export-cert <file>      export the DER certificate for client pinning
+  --admin-listen <ip:port>  HTTP admin API bind address (default 127.0.0.1:8080;
+                            requires --admin-key, keep it off public interfaces)
+  --admin-key <secret>      X-Admin-Key required on every admin request
   -h, --help                this help";
 
     let mut index = 1;
@@ -272,6 +289,14 @@ flags:
             "--export-cert" => {
                 export_cert = Some(PathBuf::from(next_value(flag)?));
             }
+            "--admin-listen" => {
+                admin_listen = Some(next_value(flag)?
+                    .parse()
+                    .map_err(|_| format!("--admin-listen: expected ip:port, got {:?}", args.get(index + 1)))?);
+            }
+            "--admin-key" => {
+                admin_key = Some(next_value(flag)?);
+            }
             other => {
                 return Err(format!("unknown flag {other:?}\n\n{usage}"));
             }
@@ -282,6 +307,16 @@ flags:
         }
         index += 1;
     }
+
+    // The admin API is enabled only with both parts: a listener without a
+    // key would be an unprotected admin surface, a key without a listener is
+    // a silent misconfiguration.
+    config.admin = match (admin_listen, admin_key) {
+        (Some(listen), Some(key)) => Some(AdminConfig { listen, key }),
+        (Some(_), None) => return Err("--admin-listen requires --admin-key: an admin API without a key would be unprotected".to_owned()),
+        (None, Some(_)) => return Err("--admin-key requires --admin-listen".to_owned()),
+        (None, None) => None,
+    };
 
     Ok(Some(Cli { config, export_cert }))
 }
@@ -307,6 +342,7 @@ mod tests {
         assert!(cli.config.tun_name.is_none());
         assert!(cli.config.is_loopback());
         assert!(cli.export_cert.is_none());
+        assert!(cli.config.admin.is_none(), "the admin API is off by default");
     }
 
     #[test]
@@ -329,6 +365,27 @@ mod tests {
         assert_eq!(cli.config.dns_servers.len(), 3, "v4, v4 and v6 DNS are parsed");
         assert_eq!(cli.export_cert.as_deref(), Some(PathBuf::from("tunnel-root.der").as_path()));
         assert!(matches!(cli.config.tokens, TokensSource::File(_)));
+    }
+
+    #[test]
+    fn admin_flags_enable_the_api_only_as_a_pair() {
+        let cli = parse_cli(&argv(&[
+            "--env-tokens",
+            "--admin-listen=127.0.0.1:8080", // inline syntax works too
+            "--admin-key", "operator-secret",
+        ])).expect("parse").expect("not help");
+        let admin = cli.config.admin.expect("the API is enabled");
+        assert_eq!(admin.listen.to_string(), "127.0.0.1:8080");
+        assert_eq!(admin.key, "operator-secret");
+
+        // Half-configured admin flags are rejected: a keyless admin API is
+        // an unprotected admin surface, a keyless-listener key is a typo.
+        let only_listen = parse_cli(&argv(&["--env-tokens", "--admin-listen", "127.0.0.1:8080"]));
+        assert!(only_listen.is_err(), "listen without a key");
+        let only_key = parse_cli(&argv(&["--env-tokens", "--admin-key", "s"]));
+        assert!(only_key.is_err(), "key without a listener");
+        let bad_addr = parse_cli(&argv(&["--env-tokens", "--admin-listen", "nope", "--admin-key", "s"]));
+        assert!(bad_addr.is_err());
     }
 
     #[test]
