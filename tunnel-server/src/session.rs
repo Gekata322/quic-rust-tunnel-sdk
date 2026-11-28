@@ -19,7 +19,10 @@
 //!   never throttled;
 //! - **idle reaping**: a session silent for [`crate::reaper::IDLE_SESSION_TIMEOUT`]
 //!   is force-closed by the background reaper and its address returns to the
-//!   pool.
+//!   pool;
+//! - **token revocation**: `DELETE /tokens/{client_id}` on the admin API
+//!   ([`crate::admin`]) removes the token and force-closes every live session
+//!   of that client.
 //!
 //! The address is returned to the pool on every session end — reuse.
 
@@ -42,7 +45,8 @@ use tunnel_proto::ipv4;
 use crate::config::ServerConfig;
 use crate::pool::IpPool;
 use crate::ratelimit::RateLimiter;
-use crate::reaper::SessionTracker;
+use crate::reaper::{SessionInfo, SessionTracker};
+use crate::registry::TokenRegistry;
 use crate::routing::RoutingTable;
 use crate::tun::TunDevice;
 
@@ -85,8 +89,9 @@ pub struct ServerShared {
     mtu: u16,
     /// Application ping period sent in `Welcome`.
     keepalive_interval_secs: u32,
-    /// Partner tokens.
-    tokens: TokenStore,
+    /// Partner tokens: a live registry — the admin API adds and revokes
+    /// entries while the server runs (see [`crate::registry`]).
+    tokens: TokenRegistry,
     /// Virtual address pool.
     pool: IpPool,
     /// "Address → client" table.
@@ -113,7 +118,7 @@ impl ServerShared {
             metrics: Arc::new(Metrics::default()),
             mtu: config.mtu,
             keepalive_interval_secs: config.keepalive_interval_secs,
-            tokens,
+            tokens: TokenRegistry::from_store(&tokens),
             pool,
             routing: RoutingTable::new(),
             sessions: SessionTracker::new(),
@@ -142,6 +147,21 @@ impl ServerShared {
         self.pool.allocated()
     }
 
+    /// Pool capacity for clients (admin `/stats`).
+    pub fn pool_capacity(&self) -> usize {
+        self.pool.capacity()
+    }
+
+    /// The mutable token registry (admin token management).
+    pub fn tokens(&self) -> &TokenRegistry {
+        &self.tokens
+    }
+
+    /// Read-only snapshot of the live sessions (admin `/stats`).
+    pub fn session_infos(&self) -> Vec<SessionInfo> {
+        self.sessions.infos()
+    }
+
     /// Spawns the idle-session reaper with the production timeouts (45s idle,
     /// 5s scan — see [`crate::reaper`]).
     pub fn spawn_idle_reaper(self: &Arc<Self>) {
@@ -161,11 +181,33 @@ impl ServerShared {
                 idle_secs = idle.as_secs(),
                 "idle session reaped — closing the connection and returning the address"
             );
-            stale.conn.close(quinn::VarInt::from_u32(0), b"idle-reaped");
-            self.routing.unregister(vip, &stale.outbound_tx);
-            self.limiter.unregister(vip);
-            let _ = self.pool.release(vip);
+            self.evict_session(vip, &stale, "idle-reaped");
         }
+    }
+
+    /// Force-closes every session of `client_id` (token revocation): the QUIC
+    /// connection is closed with the `token-revoked` reason, routes and rate
+    /// buckets are removed, virtual addresses return to the pool. Returns the
+    /// number of killed sessions. The caller has already removed the token
+    /// entry, so the client's next handshake is rejected as unknown.
+    pub fn revoke_client_sessions(&self, client_id: &str) -> usize {
+        let taken = self.sessions.take_by_client(client_id);
+        let count = taken.len();
+        for (vip, stale) in taken {
+            tracing::info!(client_id = %client_id, vip = %vip, "token revoked — kicking the session");
+            self.evict_session(vip, &stale, "token-revoked");
+        }
+        count
+    }
+
+    /// Common finalization of an evicted session (the reaper and the
+    /// revocation path). Idempotent: the session task's own later cleanup is
+    /// a no-op on every step.
+    fn evict_session(&self, vip: Ipv4Addr, stale: &crate::reaper::TrackedSession, reason: &str) {
+        stale.conn.close(quinn::VarInt::from_u32(0), reason.as_bytes());
+        self.routing.unregister(vip, &stale.outbound_tx);
+        self.limiter.unregister(vip);
+        let _ = self.pool.release(vip);
     }
 
     /// Starts the TUN reader: packets from the kernel → clients by the `RoutingTable`.
@@ -572,6 +614,7 @@ mod tests {
             tun_name: None,
             server_name: "localhost".to_owned(),
             tokens: TokensSource::Inline(vec![("c".to_owned(), "t".to_owned())]),
+            admin: None,
         }
     }
 
@@ -597,6 +640,17 @@ mod tests {
         shared.reap_idle_sessions(std::time::Duration::from_millis(1));
         assert_eq!(shared.active_clients(), 0);
         assert_eq!(shared.allocated_addresses(), 0);
+    }
+
+    #[test]
+    fn revoking_an_unknown_client_is_a_noop() {
+        let shared = shared_state();
+        assert_eq!(shared.revoke_client_sessions("nobody"), 0);
+        assert_eq!(shared.active_clients(), 0);
+        assert_eq!(shared.allocated_addresses(), 0);
+        assert_eq!(shared.pool_capacity(), 253, "/24 minus network, broadcast, server");
+        assert_eq!(shared.tokens().len(), 1);
+        assert!(shared.session_infos().is_empty());
     }
 
     #[test]
