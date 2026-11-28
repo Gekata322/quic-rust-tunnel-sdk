@@ -34,6 +34,16 @@ pub enum TokensSource {
     Env,
 }
 
+/// HTTP admin API configuration (see [`crate::admin`]).
+#[derive(Debug, Clone)]
+pub struct AdminConfig {
+    /// Bind address of the API. Keep it on a private interface — the default
+    /// and documented value is `127.0.0.1:8080` (the API is not for clients).
+    pub listen: SocketAddr,
+    /// Shared secret required in `X-Admin-Key` on every request.
+    pub key: String,
+}
+
 /// Full server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -54,6 +64,8 @@ pub struct ServerConfig {
     pub server_name: String,
     /// Token source.
     pub tokens: TokensSource,
+    /// HTTP admin API; `None` — the API is disabled (the default).
+    pub admin: Option<AdminConfig>,
 }
 
 impl ServerConfig {
@@ -86,6 +98,13 @@ impl ServerConfig {
                 mtu = self.mtu
             )));
         }
+        if let Some(admin) = &self.admin {
+            if admin.key.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "admin.key is empty — the admin API would be unprotected".to_owned(),
+                ));
+            }
+        }
         // Port 0 is legal: the OS issues an ephemeral one (tests, dynamic deploys).
         // The subnet is validated by IpPool at server state startup.
         Ok(())
@@ -112,6 +131,7 @@ mod tests {
             tun_name: None,
             server_name: "localhost".to_owned(),
             tokens: TokensSource::Inline(vec![("c".to_owned(), "t".to_owned())]),
+            admin: None,
         }
     }
 
@@ -153,5 +173,22 @@ mod tests {
         let mut ok = base();
         ok.listen = "127.0.0.1:0".parse().expect("ephemeral port");
         assert!(ok.validate().is_ok(), "port 0 is a valid ephemeral listener");
+    }
+
+    #[test]
+    fn admin_key_must_not_be_empty() {
+        let mut ok = base();
+        ok.admin = Some(AdminConfig {
+            listen: "127.0.0.1:8080".parse().expect("address"),
+            key: "secret".to_owned(),
+        });
+        assert!(ok.validate().is_ok());
+
+        let mut bad = base();
+        bad.admin = Some(AdminConfig {
+            listen: "127.0.0.1:8080".parse().expect("address"),
+            key: "   ".to_owned(),
+        });
+        assert!(matches!(bad.validate(), Err(ConfigError::Invalid(_))));
     }
 }

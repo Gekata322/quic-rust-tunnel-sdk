@@ -37,6 +37,17 @@ pub(crate) struct TrackedSession {
     pub(crate) last_activity: Instant,
 }
 
+/// A read-only view of a live session for diagnostics and the admin API.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// Partner identifier the session authenticated with.
+    pub client_id: String,
+    /// The assigned virtual address.
+    pub vip: Ipv4Addr,
+    /// Time since the last inbound control message or datagram.
+    pub idle: Duration,
+}
+
 /// Registry of live sessions with their last inbound activity.
 #[derive(Default)]
 pub struct SessionTracker {
@@ -96,6 +107,36 @@ impl SessionTracker {
         stale
             .into_iter()
             .filter_map(|vip| sessions.remove(&vip).map(|session| (vip, session)))
+            .collect()
+    }
+
+    /// Removes and returns all sessions of `client_id` (token revocation).
+    /// A client may hold several addresses when a fast reconnect overlapped
+    /// the old session's cleanup — all of them are taken.
+    pub(crate) fn take_by_client(&self, client_id: &str) -> Vec<(Ipv4Addr, TrackedSession)> {
+        let mut sessions = self.sessions.lock().expect("tracker mutex");
+        let matched: Vec<Ipv4Addr> = sessions
+            .iter()
+            .filter(|(_, session)| session.client_id == client_id)
+            .map(|(vip, _)| *vip)
+            .collect();
+        matched
+            .into_iter()
+            .filter_map(|vip| sessions.remove(&vip).map(|session| (vip, session)))
+            .collect()
+    }
+
+    /// Read-only snapshot of the tracked sessions (admin `/stats`).
+    pub fn infos(&self) -> Vec<SessionInfo> {
+        self.sessions
+            .lock()
+            .expect("tracker mutex")
+            .iter()
+            .map(|(vip, session)| SessionInfo {
+                client_id: session.client_id.clone(),
+                vip: *vip,
+                idle: session.last_activity.elapsed(),
+            })
             .collect()
     }
 

@@ -12,17 +12,23 @@
 //! - [`routing`] — the "assigned address → client" table;
 //! - [`ratelimit`] — per-client token-bucket caps for the data plane;
 //! - [`reaper`] — the idle-session reaper that protects the address pool
-//!   from clients that vanished without a close.
+//!   from clients that vanished without a close;
+//! - [`registry`] — the mutable token registry behind the admin API;
+//! - [`admin`] — the HTTP admin API: token management and statistics
+//!   (axum, `X-Admin-Key`, loopback by default).
 
+pub mod admin;
 pub mod config;
 pub mod endpoint;
 pub mod pool;
 pub mod ratelimit;
 pub mod reaper;
+pub mod registry;
 pub mod routing;
 pub mod session;
 pub mod tun;
 
 pub use pool::IpPool;
+pub use registry::TokenRegistry;
 pub use routing::RoutingTable;
 pub use session::ServerShared;
