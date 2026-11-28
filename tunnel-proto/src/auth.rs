@@ -74,7 +74,7 @@ impl TokenStore {
     /// server never reveals which identifier exists.
     pub fn verify(&self, client_id: &str, token: &str) -> bool {
         self.entries.iter().any(|entry| {
-            entry.client_id == client_id && const_eq(token.as_bytes(), entry.token.as_bytes())
+            entry.client_id == client_id && const_time_eq(token.as_bytes(), entry.token.as_bytes())
         })
     }
 
@@ -161,8 +161,10 @@ fn parse_bandwidth(spec: &str) -> Option<u32> {
 }
 
 /// Constant-time byte-slice equality: XOR accumulates over the whole length;
-/// the only early exit is a length mismatch (lengths are not secret).
-fn const_eq(a: &[u8], b: &[u8]) -> bool {
+/// the only early exit is a length mismatch (lengths are not secret). Public
+/// so the server-side registry and the admin-key check reuse one audited
+/// implementation.
+pub fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -256,11 +258,11 @@ mod tests {
     }
 
     #[test]
-    fn const_eq_covers_length_and_content() {
-        assert!(const_eq(b"abc", b"abc"));
-        assert!(!const_eq(b"abc", b"abd"));
-        assert!(!const_eq(b"abc", b"abcd"));
-        assert!(const_eq(b"", b""));
+    fn const_time_eq_covers_length_and_content() {
+        assert!(const_time_eq(b"abc", b"abc"));
+        assert!(!const_time_eq(b"abc", b"abd"));
+        assert!(!const_time_eq(b"abc", b"abcd"));
+        assert!(const_time_eq(b"", b""));
     }
 
     #[test]

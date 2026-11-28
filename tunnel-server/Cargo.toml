@@ -22,8 +22,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] 
 tracing = { workspace = true }
 thiserror = { workspace = true }
 rcgen = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tunnel-core = { path = "../tunnel-core" }
 rustls = { workspace = true }
 rcgen = { workspace = true }
+serde_json = { workspace = true }
+# Router unit tests without sockets: ServiceExt::oneshot.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

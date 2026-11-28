@@ -27,11 +27,16 @@ bincode = "2.0"
 thiserror = "2"
 tracing = "0.1"
 
+# Admin HTTP API (server only)
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+
 # FFI bindings
 uniffi = { version = "0.32.2", features = ["cli"] }
 
 # Dev/test only
 rcgen = "0.14"
+serde_json = "1"
 
 # Release profile for the SDK: maximum speed, minimal size
 [profile.release]
