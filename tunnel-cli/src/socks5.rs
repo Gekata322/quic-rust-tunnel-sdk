@@ -257,6 +257,7 @@ async fn handle_connection(
             return;
         }
     };
+
     let destination = match &target.host {
         TargetHost::Ip(ip) => *ip,
         TargetHost::Domain(name) => match resolve_domain(name, target.port).await {
@@ -391,6 +392,7 @@ mod tests {
         .await;
         let mut method = [0u8; 2];
         harness.client.read_exact(&mut method).await.expect("method reply");
+        assert_eq!(method, [VERSION, METHOD_NONE]);
         drop(harness.client); // EOF: the proxy must finish on its own
         let target = harness.result.await.expect("negotiate task").expect("parsed target");
         assert_eq!(
