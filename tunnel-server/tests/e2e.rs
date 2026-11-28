@@ -10,7 +10,9 @@
 //! client, and pool exhaustion yields a retryable `ServerBusy`, not a
 //! permanent stop. Stage-3 additions: an idle session is reaped and its VIP
 //! returns to the pool while a live session survives, and a capped client
-//! has its excess datagrams dropped by the token bucket.
+//! has its excess datagrams dropped by the token bucket. Stage-4 addition:
+//! the admin API — auth, hot token add, and hot revocation that kicks the
+//! live session, frees the VIP and stops the engine permanently.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,8 +37,16 @@ struct TestServer {
     addr: SocketAddr,
     cert_der: Vec<u8>,
     shared: Arc<ServerShared>,
-    /// Held alive so accept_loop does not see a closed stop channel.
-    _shutdown_tx: watch::Sender<bool>,
+    /// Kept alive so accept_loop (and the admin API) do not see a closed
+    /// stop channel; `shutdown_rx()` hands out receivers.
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl TestServer {
+    /// A fresh shutdown receiver for the admin API.
+    fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
 }
 
 /// Starts a server on 127.0.0.1:0 in loopback mode (TUN is unavailable in CI).
@@ -52,6 +62,8 @@ async fn start_server_with_tokens(tokens: TokenStore, pool: &str) -> TestServer 
         server_name: "localhost".to_owned(),
         // The store is passed directly; the source in the config is unused.
         tokens: TokensSource::Inline(Vec::new()),
+        // The admin API is spawned per-test where needed (an ephemeral port).
+        admin: None,
     };
     let cert = generate_certificate("localhost").expect("certificate");
     let cert_der = cert.der.as_ref().to_vec();
@@ -65,7 +77,7 @@ async fn start_server_with_tokens(tokens: TokenStore, pool: &str) -> TestServer 
         addr,
         cert_der,
         shared,
-        _shutdown_tx: shutdown_tx,
+        shutdown_tx,
     }
 }
 
@@ -600,4 +612,232 @@ async fn rate_limit_drops_datagrams_over_the_cap() {
         server.shared.routing().route(slow_session.welcome.vip).is_some(),
         "the capped session is still routable"
     );
+}
+
+/// Sends one HTTP/1.1 request to the admin API over a raw TCP socket and
+/// returns `(status, json body)`. `Connection: close` makes the server close
+/// the socket after the answer, so reading to EOF is a complete response.
+/// A hand-rolled client keeps the E2E dependency tree lean (no reqwest) and
+/// exercises the real socket path end to end.
+async fn admin_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: Option<&str>,
+) -> (u16, serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("admin server is reachable");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(key) = key {
+        request.push_str(&format!("X-Admin-Key: {key}\r\n"));
+    }
+    if let Some(body) = body {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request written");
+    if let Some(body) = body {
+        stream.write_all(body.as_bytes()).await.expect("body written");
+    }
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("response read to EOF");
+    let text = std::str::from_utf8(&response).expect("a UTF-8 HTTP response");
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .expect("a status line")
+        .parse()
+        .expect("a numeric status code");
+    let body_start = text
+        .find("\r\n\r\n")
+        .expect("headers are terminated") + 4;
+    let json = if body_start < text.len() {
+        serde_json::from_str(&text[body_start..]).expect("a JSON body")
+    } else {
+        serde_json::Value::Null
+    };
+    (status, json)
+}
+
+/// Stage 4: the admin API protects itself with `X-Admin-Key`, hot-adds tokens
+/// that work for new handshakes without a restart, and hot-revokes a token:
+/// the live session is kicked (the VIP returns to the pool), the client's
+/// reconnect attempt is rejected with `InvalidToken` — a permanent error —
+/// so the engine stops, and an unrelated client keeps working.
+#[tokio::test]
+async fn admin_api_revokes_tokens_and_kills_live_sessions() {
+    let server = start_server(vec![("victim".to_owned(), "victim-token".to_owned())], "10.66.0.0/24").await;
+    let admin_addr = tunnel_server::admin::spawn_admin_server(
+        Arc::clone(&server.shared),
+        &tunnel_server::config::AdminConfig {
+            listen: "127.0.0.1:0".parse().expect("bind address"),
+            key: "stage4-admin-key".to_owned(),
+        },
+        server.shutdown_rx(),
+    )
+    .await
+    .expect("admin server bound");
+    assert_ne!(admin_addr.port(), 0, "the OS issued an ephemeral port");
+
+    // The victim is connected before any admin call.
+    let victim = Arc::new(
+        TunnelClient::new(client_config(&server, "victim-token", "victim")).expect("client"),
+    );
+    victim.connect().expect("engine start");
+    wait_state(&victim, |s| matches!(s, TunnelState::Connected { .. }), 5).await;
+    let victim_vip = parse_vip(&victim.negotiated_vip().expect("vip issued"));
+
+    // --- Authorization: no key and a wrong key are indistinguishable 401s.
+    for key in [None, Some("wrong-key")] {
+        let (status, body) = admin_request(admin_addr, "GET", "/stats", key, None).await;
+        assert_eq!(status, 401, "key: {key:?}");
+        assert_eq!(body["error"], "missing or invalid X-Admin-Key header");
+    }
+
+    // --- GET /stats with the correct key sees the live session.
+    let (status, stats) = admin_request(admin_addr, "GET", "/stats", Some("stage4-admin-key"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(stats["mode"], "loopback");
+    assert_eq!(stats["active_clients"], 1);
+    assert_eq!(stats["allocated_addresses"], 1);
+    assert_eq!(stats["tokens"], 1);
+    assert_eq!(stats["metrics"]["sessions_established"], 1);
+    let sessions = stats["sessions"].as_array().expect("a session list");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["client_id"], "victim");
+    assert_eq!(sessions[0]["vip"], "10.66.0.2");
+
+    // --- POST /tokens: validation errors first.
+    for bad_body in [
+        r#"{"client_id":"  ","token":"tok"}"#,
+        r#"{"client_id":"guest","token":"  "}"#,
+        r#"{"client_id":"guest","token":"tok","rate_limit_mbps":0}"#,
+    ] {
+        let (status, _) = admin_request(
+            admin_addr,
+            "POST",
+            "/tokens",
+            Some("stage4-admin-key"),
+            Some(bad_body),
+        )
+        .await;
+        assert_eq!(status, 400, "body: {bad_body}");
+    }
+
+    // --- POST /tokens hot-add: 201, then a brand-new client connects with
+    // the fresh token — no server restart involved.
+    let (status, body) = admin_request(
+        admin_addr,
+        "POST",
+        "/tokens",
+        Some("stage4-admin-key"),
+        Some(r#"{"client_id":"guest","token":"guest-token","rate_limit_mbps":10}"#),
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_eq!(body["created"], true);
+    assert_eq!(body["rate_limit_mbps"], 10);
+    assert!(server.shared.tokens().verify("guest", "guest-token"));
+
+    let guest = Arc::new(
+        TunnelClient::new(client_config(&server, "guest-token", "guest")).expect("client"),
+    );
+    guest.connect().expect("engine start");
+    wait_state(&guest, |s| matches!(s, TunnelState::Connected { .. }), 5).await;
+    let guest_vip = parse_vip(&guest.negotiated_vip().expect("vip issued"));
+    assert_ne!(victim_vip, guest_vip, "two live clients hold distinct VIPs");
+
+    // Replacing the same client answers 200 created=false and swaps the secret.
+    let (status, body) = admin_request(
+        admin_addr,
+        "POST",
+        "/tokens",
+        Some("stage4-admin-key"),
+        Some(r#"{"client_id":"guest","token":"guest-token-2"}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["created"], false);
+    assert!(server.shared.tokens().verify("guest", "guest-token-2"));
+    // The already-connected guest keeps its session; restore the original token.
+    let (status, _) = admin_request(
+        admin_addr,
+        "POST",
+        "/tokens",
+        Some("stage4-admin-key"),
+        Some(r#"{"client_id":"guest","token":"guest-token"}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // --- DELETE /tokens/victim: hot revocation kicks the live session.
+    let (status, body) =
+        admin_request(admin_addr, "DELETE", "/tokens/victim", Some("stage4-admin-key"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["revoked"], true);
+    assert_eq!(body["sessions_killed"], 1);
+    assert_eq!(body["client_id"], "victim");
+
+    // Server state is cleaned synchronously: the route is gone, the VIP is back.
+    assert_eq!(server.shared.active_clients(), 1, "the guest stays");
+    assert_eq!(server.shared.allocated_addresses(), 1, "the victim's VIP is freed");
+    assert!(
+        server
+            .shared
+            .routing()
+            .route(std::net::Ipv4Addr::from(victim_vip))
+            .is_none(),
+        "the victim's route is removed"
+    );
+
+    // A second revocation finds nothing: 404.
+    let (status, _) =
+        admin_request(admin_addr, "DELETE", "/tokens/victim", Some("stage4-admin-key"), None).await;
+    assert_eq!(status, 404);
+
+    // The victim's engine sees its session drop, retries, gets Reject
+    // {InvalidToken} — permanent — and stops instead of retrying forever.
+    wait_state(&victim, |s| matches!(s, TunnelState::Stopped), 10).await;
+    // Exactly two sessions were ever established (victim + guest): the
+    // rejected reconnect attempt never opened a new one.
+    let snap = server.shared.metrics.snapshot();
+    assert_eq!(
+        snap.sessions_established, 2,
+        "no session is established with a revoked token: {snap:?}"
+    );
+
+    // /stats reflects the revocation: one token left, one live client and
+    // the session list contains only the guest.
+    let (status, stats) =
+        admin_request(admin_addr, "GET", "/stats", Some("stage4-admin-key"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(stats["tokens"], 1, "the victim's entry is gone");
+    assert_eq!(stats["active_clients"], 1);
+    let sessions = stats["sessions"].as_array().expect("a session list");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["client_id"], "guest");
+
+    // The guest is untouched by the victim's revocation and still exchanges
+    // packets (keepalive pings count as inbound activity for the reaper, so
+    // a full echo roundtrip is the strongest liveness proof here).
+    let server_vip = server.shared.server_vip.octets();
+    let echoed = echo_roundtrip(&guest, Some(&server), build_ipv4(guest_vip, server_vip, b"alive")).await;
+    assert_eq!(&echoed[16..20], &guest_vip);
+    assert_eq!(&echoed[20..], b"alive");
+
+    guest.disconnect();
+    victim.disconnect();
+    wait_state(&guest, |s| matches!(s, TunnelState::Stopped), 5).await;
 }
