@@ -4,6 +4,7 @@ members = [
     "tunnel-proto",
     "tunnel-core",
     "tunnel-server",
+    "tunnel-cli",
 ]
 
 [workspace.package]
@@ -26,6 +27,11 @@ bytes = "1"
 bincode = "2.0"
 thiserror = "2"
 tracing = "0.1"
+
+# tunnel-cli: argument parsing and the userspace TCP/IP stack that turns the
+# tunnel's raw IP packets into TCP streams for the SOCKS5 proxy
+clap = { version = "4.6", features = ["derive", "env"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "alloc", "medium-ip", "proto-ipv4", "socket-tcp"] }
 
 # Admin HTTP API (server only)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

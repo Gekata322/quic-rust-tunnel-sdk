@@ -1,0 +1,32 @@
+[package]
+name = "tunnel-cli"
+description = "tunnel-cli: SOCKS5 proxy over the QUIC tunnel — root-free usage on top of tunnel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tunnel-cli"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tunnel-core = { path = "../tunnel-core" }
+tokio = { workspace = true }
+clap = { workspace = true }
+smoltcp = { workspace = true }
+# ManagedSlice: the heap-backed storage of the TCP socket buffers
+managed = { version = "0.8", default-features = false, features = ["alloc"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tunnel-server = { path = "../tunnel-server" }
+tunnel-proto = { workspace = true }
+rcgen = { workspace = true }
+# E2E logs: the tests initialize the same subscriber as the binaries.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
