@@ -1,23 +1,63 @@
 🌐 **English** | [🇷🇺 Русский](README.ru.md)
 
-# tunnel-mvp — Commercial B2B Tunnel SDK in Rust
+# tunnel — Commercial B2B Tunnel SDK in Rust
 
-A secure tunnel for embedding into client applications (iOS / Android /
-Desktop / Python) and for deploying a server on Linux. The transport is QUIC
-(`quinn` + `rustls`) on top of the `tokio` async runtime. Partners receive a
+Partners embed your product's connectivity into their applications, but
+their traffic must egress through *your* infrastructure: one token per
+partner, one virtual address per client, traffic that is QUIC end-to-end
+and that a middlebox cannot fingerprint as anything but noise. That is the
+problem this repository solves, in three deployable pieces:
+
+- **`tunnel-core`** — the client SDK (iOS / Android / Desktop / Python):
+  five control methods, a pinned-server-certificate QUIC session,
+  exponential-backoff reconnects, connection migration on network changes
+  (RFC 9000 — the VIP and the data plane survive a Wi-Fi ↔ cellular switch).
+- **`tunnel-server`** — the Linux server: B2B token authentication,
+  a virtual-IP pool, an idle-session reaper, per-client bandwidth caps,
+  hot token revocation over an HTTP admin API, and NAT-ready TUN mode.
+- **`tunnel-cli`** — a SOCKS5 proxy for desktop machines: any SOCKS5-capable
+  application goes through the tunnel with **no root and no TUN device** —
+  a userspace TCP/IP stack (smoltcp) turns the tunnel's raw IP packets back
+  into TCP streams.
+
+The transport is QUIC (`quinn` + `rustls`) on `tokio`. Partners receive a
 ready-to-ship SDK: native libraries + Swift/Kotlin/Python bindings from
 `dist/` (see **[INTEGRATION.md](INTEGRATION.md)** — integration takes ~10
 lines of code per language).
 
-## Components
+## Components (repository map)
 
 | Crate / file | Purpose |
 | --- | --- |
 | `tunnel-proto` | Shared protocol: control messages (bincode + length prefix), IP-packet framing for QUIC datagrams, IPv4 header parsing, constant-time token verification, telemetry counters |
-| `tunnel-core` | **SDK core** (`cdylib`/`staticlib`), FFI via `uniffi`: five control methods (`new`/`connect`/`disconnect`/`get_telemetry`/`set_status_callback`), QUIC client with a pinned server certificate, exponential-backoff reconnect, RTT ping, poll-based packet exchange |
-| `tunnel-server` | Server: B2B token authentication (file/env), virtual-IP pool with address reuse, routing table, Linux TUN interface, loopback mode for tests |
+| `tunnel-core` | **SDK core** (`cdylib`/`staticlib`), FFI via `uniffi`: five control methods (`new`/`connect`/`disconnect`/`get_telemetry`/`set_status_callback`), QUIC client with a pinned server certificate, exponential-backoff reconnect, QUIC connection migration, RTT ping, poll-based packet exchange |
+| `tunnel-server` | Server: token auth (file/env + admin API), virtual-IP pool with address reuse, idle-session reaper (45 s), token-bucket bandwidth caps (`client:token:10mbps`), routing table, Linux TUN interface, loopback mode for CI |
+| `tunnel-cli` | Desktop client: SOCKS5 listener on `127.0.0.1:1080`, userspace TCP/IP stack over the tunnel's packet queues, periodic status/RTT/throughput reporting — no root required |
 | `build_sdk.sh` | One-command SDK build: release libraries + bindings → `dist/` |
 | `INTEGRATION.md` | Embedding guide with examples (Swift / Kotlin / Python) |
+
+## Quick Start (15 lines, no root on the client)
+
+```bash
+# ── server (Linux, once): TUN mode; it prints the exact NAT commands ──
+TUNNEL_TOKENS="demo:demo-token" tunnel-server --listen 0.0.0.0:443 --env-tokens \
+    --tun tunnel0 --pool 10.66.0.0/24 --server-name tunnel.example.com \
+    --export-cert tunnel-root.der
+sysctl -w net.ipv4.ip_forward=1                 # printed by the server above,
+iptables -t nat -A POSTROUTING -s 10.66.0.0/24 ! -o tunnel0 -j MASQUERADE  # with real values
+
+# ── client (macOS / Windows / Linux — an unprivileged user) ──
+tunnel-cli --server tunnel.example.com:443 --cert tunnel-root.der --token demo-token
+# info: tunnel connected vip=10.66.0.2 mtu=1280
+# info: tunnel is up; the SOCKS5 listener is opening on 127.0.0.1:1080
+# info: tunnel stats status=connected ping=Some("41 ms") down=1.2 KiB/s ...
+
+# ── any SOCKS5 application now egresses through your server ──
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me/   # shows the server's IP
+```
+
+Embedding the SDK instead of running the CLI: `TunnelClient` + a platform
+TUN — see **[INTEGRATION.md](INTEGRATION.md)**.
 
 ## SDK: Public API of the Client Core
 
@@ -48,9 +88,10 @@ level (Kotlin/Swift/Python), so a minimal integration takes four parameters.
 ## Build and Verification
 
 ```bash
-cargo test  --workspace      # 84 tests: protocol, core, server + E2E (server ↔ client)
+cargo test  --workspace      # 120 tests: protocol, core, server, CLI + E2E
 cargo build -p tunnel-core   # lib + cdylib (.so) + staticlib (.a)
 cargo build -p tunnel-server # the tunnel-server binary
+cargo build -p tunnel-cli    # the tunnel-cli binary
 
 ./build_sdk.sh               # SDK in one command → dist/ (see dist/README.md)
 ./build_sdk.sh --skip-tests  # rebuild without running the tests
@@ -66,11 +107,12 @@ writes `SHA256SUMS`. If the `aarch64-linux-android` target is installed,
 ## Running the Server
 
 ```bash
-# Token file: one "client_id:token" pair per line, '#' starts a comment.
+# Token file: one "client_id:token[:mbps]" pair per line, '#' starts a
+# comment; the optional suffix caps the client's bandwidth (token bucket).
 cat > tokens.txt <<'EOF'
 # partner "example"
 example-ios: b2b-live-a1b2c3d4
-example-android: b2b-live-e5f6g7h8
+example-android: b2b-live-e5f6g7h8:10mbps
 EOF
 
 # Production mode: TUN + certificate export for client-side pinning
@@ -78,33 +120,20 @@ tunnel-server --listen 0.0.0.0:4433 --tokens tokens.txt \
     --tun tunnel0 --pool 10.66.0.0/24 --mtu 1280 \
     --server-name tunnel.example.com --export-cert tunnel-root.der
 
-# Loopback mode (no CAP_NET_ADMIN privileges): echo only to the server's own
-# address — for client checks and CI. Tokens can come from an environment variable.
-TUNNEL_TOKENS="ci-client:ci-token" tunnel-server --listen 127.0.0.1:4433 --env-tokens
+# HTTP admin API (loopback only, X-Admin-Key protected):
+#   POST   /tokens              {"client_id": "...", "token": "...", "mbps": 10}
+#   DELETE /tokens/{client_id}  hot revocation — kicks live sessions
+#   GET    /stats               live session/IPAM/traffic counters
+TUNNEL_TOKENS="ci-client:ci-token" tunnel-server --listen 127.0.0.1:4433 --env-tokens \
+    --admin-listen 127.0.0.1:8080 --admin-key operator-secret
+
+# Loopback mode (no --tun, no CAP_NET_ADMIN): echo only to the server's own
+# address — for client checks and CI.
 ```
 
-To route client traffic to the outside world (right after startup with
-`--tun` the server prints these commands with the actual values):
-
-```bash
-sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -s 10.66.0.0/24 ! -o tunnel0 -j MASQUERADE
-iptables -A FORWARD -i tunnel0 -j ACCEPT
-iptables -A FORWARD -o tunnel0 -j ACCEPT
-```
-
-The client takes `tunnel-root.der` (DER) as `pinned_server_cert_der` and
-`tunnel.example.com` as `server_name` (it must match the certificate SAN);
-the assigned address reaches the partner via the `Connected { mtu, vip }`
-callback — it is used to configure the platform TUN. Packets carrying a
-sender address other than the client's own are dropped by the server
-(anti-spoofing).
-
-Tokens are kept in memory in plain text and compared in constant time
-(`tunnel_proto::auth`); HMAC tokens with rotation and issuance through a
-partner broker are on the roadmap. The server certificate in the MVP is
-self-signed (`rcgen`) — replace it with the partner's CA certificate for
-production deployments.
+A session silent for 45 seconds is reaped by the server (the connection is
+closed and the address returns to the pool); capped clients have their
+excess datagrams dropped, not queued.
 
 ## Regenerating Bindings
 
@@ -124,33 +153,40 @@ For a single language use the standard uniffi CLI: `generate --library <lib>
 --language swift --out-dir <dir>`. The up-to-date generated bindings live in
 `bindings/`; they are shipped to the partner via `dist/`.
 
-## Status
+## Non-Goals
 
-- [x] Step 1 — workspace, `tunnel-proto` (messages, frames, IPv4, auth, metrics)
-- [x] Step 2 — `tunnel-core`: QUIC client, FFI (`TunnelClient`), reconnect with
-  backoff, network-change handling; integration test against a local QUIC
-  server; generated bindings
-- [x] Step 3 — `tunnel-server`: tokens, IP pool, routing table, TUN,
-  loopback mode; server ↔ client E2E tests (echo, multiple clients, reject)
-- [x] Step 4 — commercial SDK: 5-method API + status callback
-  (`Connected`/`Reconnecting`/`Disconnected`), telemetry with ping, config
-  defaults at the FFI boundary; `uniffi-bindgen generate-all`
-  (Kotlin/Swift/Python); `build_sdk.sh` → `dist/`; `INTEGRATION.md`;
-  Python-binding smoke test against a live server
+This is a focused tunnel, not a general-purpose VPN framework:
 
-### Known Limitations
+- **No anonymous/public VPN product.** Clients authenticate with per-partner
+  B2B tokens; there is no user registration, billing or captive portal.
+- **No dynamic routing mesh.** One server per deployment; clients get one
+  address from a flat IPv4 pool.
+- **No plugin transport layer.** QUIC with a pinned certificate is the only
+  transport; traffic shaping (伪装) is explicitly out of scope.
+- **No kernel-bypass performance work.** The MVP targets partner-grade
+  throughput on stock `quinn`; io_uring/XDP remains future work.
+- **The server does not manage the host firewall** — it prints the exact
+  `iptables`/`sysctl` commands instead of mutating the operator's system.
+
+## Known Limitations
 
 - IPv6: `KIND_IPV6` frames are accepted, but v6 routing is not implemented —
   in TUN mode they are forwarded as is, in loopback mode they are dropped.
-- The server does not recompute IP checksums (that is the core's job);
-  the loopback echo only rewrites the addresses in the header.
+- `tunnel-cli` resolves domain names with the system resolver — DNS does not
+  traverse the tunnel in this version (CONNECT with an IP literal always
+  works; DNS-over-tunnel is on the roadmap).
+- The server does not recompute IP checksums (that is the stack's job); the
+  loopback echo only rewrites the addresses in the header.
+- A closed TCP session lingers in TIME_WAIT for 10 s (smoltcp's bound) —
+  the ephemeral port space (16 384 ports) absorbs normal proxy churn.
 - The real TUN loop is not exercised in CI (no `CAP_NET_ADMIN`): the TUN path
-  is covered by component unit tests, the E2E runs through loopback mode.
+  is covered by component unit tests, the E2E runs through loopback mode and
+  inter-client routing.
 - Android/iOS targets in the distribution are limited by the build
   environment: `arm64-v8a` is built when the NDK target is available,
   iOS is built on macOS (see INTEGRATION.md).
-- On the roadmap: per-client rate limiting, token rotation, QUIC connection
-  migration between interfaces, Prometheus-format metrics.
+- On the roadmap: DNS-over-tunnel, token rotation/HMAC issuance via a
+  partner broker, Prometheus-format metrics, IPv6 data plane.
 
 ## Commercial Licensing & Custom Integration
 
