@@ -424,7 +424,7 @@ fn runner(client: Arc<TunnelClient>, mut commands: mpsc::Receiver<Command>, live
 
         // Reconnect handling: with the same VIP the TCP sessions survive
         // (both stacks keep their state, only in-flight packets were lost —
-// TCP retransmits); a new VIP makes every packet's source foreign,
+        // TCP retransmits); a new VIP makes every packet's source foreign,
         // so the sessions are aborted.
         if let TunnelState::Connected { vip: state_vip, mtu } = client.state() {
             device.mtu = usize::from(mtu);
